@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MFF Spatial Designer｜S4-M2 二维调度</title>
+    <link rel="icon" type="image/png" href="%BASE_URL%favicon.png" />
+    <meta name="description" content="MFF S4-M2 二维场景调度、人物走位与镜头几何编辑器。" />
+    <meta name="theme-color" content="#171717" />
+    <meta property="og:title" content="MFF Spatial Designer" />
+    <meta property="og:description" content="MFF S4-M2 二维场景调度、人物走位与镜头几何编辑器。" />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <script>
+      // Dark unless the person chose light: set before the app paints, so the
+      // page never flashes white on the way in.
+      try {
+        if (localStorage.getItem('cineplan_theme') !== 'light') document.documentElement.classList.add('dark');
+      } catch (_) {
+        document.documentElement.classList.add('dark');
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

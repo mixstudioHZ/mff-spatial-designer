@@ -1,0 +1,660 @@
+import React, { useCallback, useRef, useState } from 'react';
+import { PanelTitle } from '../common/PanelHeader';
+import { useDismiss } from '../common/useDismiss';
+import {
+  ArrowRight,
+  Camera,
+  EyeOff,
+  GripVertical,
+  Image as ImageIcon,
+  Layers,
+  Maximize2,
+  Plus,
+  SlidersHorizontal,
+  Trash2,
+  Upload,
+  Video,
+  X,
+} from 'lucide-react';
+import { useFloorPlan } from '../../context/FloorPlanContext';
+import { useDialogs } from '../dialog/DialogProvider';
+import { AspectRatio, CameraElement, Shot } from '../../types';
+import { ASPECT_RATIOS } from '../../constants/presets';
+import { orderedStoryboardShots } from '../../utils/storyboardOrder';
+import {
+  FrameSlot,
+  START_SLOT,
+  isSlotOmitted,
+  setFramePatch,
+  setSlotOmittedPatch,
+  setSlotsPresetPatch,
+  slotsOf,
+  toggleSlotOmittedPatch,
+  visibleStoryboardSlots,
+} from '../../utils/storyboardFrames';
+import { loadStoryboardImageFile } from '../../utils/image';
+import { ProjectImage } from '../common/ProjectImage';
+import { useWorkspaceUI } from '../../context/WorkspaceUIContext';
+import { PdfExportButton } from '../common/PdfExportButton';
+import { useLanguage } from '../../i18n/LanguageContext';
+import { cameraMovementLabel, generatedProjectTextLabel, shotSizeLabel, storyboardSlotLabel } from '../../i18n/domainLabels';
+
+/** A moving shot is boarded on each of its camera's keyframes. */
+export const shotHasMove = (shot: Shot): boolean =>
+  !!shot.movement && shot.movement !== 'Static';
+
+/**
+ * Storyboard-only view of the active scene: one frame per shot (two for shots
+ * with a camera move).
+ *
+ * It is the same data as the shot list — adding a frame here also creates the
+ * shot and drops its camera on the floor plan, and shots created anywhere else
+ * appear here (blank until a storyboard image is attached). Frames drag into
+ * order and their description is editable in place.
+ */
+export const StoryboardPanel: React.FC = () => {
+  const { lang } = useLanguage();
+  const isZh = lang === 'zh';
+  const { activeSetup, selectedShotId, selectShot, updateShot, deleteShot, setStoryboardOrder, createCameraAndShot, openViewfinder, updateSetupMeta, displaySettings, updateDisplaySettings } = useFloorPlan();
+  const { notice } = useDialogs();
+  const { openExportModal, theme } = useWorkspaceUI();
+
+  const isLight = theme === 'light';
+  const hideBlankWaypoints = displaySettings.hideBlankStoryboardWaypoints ?? false;
+  const [openWaypointsShotId, setOpenWaypointsShotId] = useState<string | null>(null);
+  const waypointsCardRef = useRef<HTMLDivElement>(null);
+  useDismiss(openWaypointsShotId !== null, useCallback(() => setOpenWaypointsShotId(null), []), waypointsCardRef);
+  const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
+  const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
+  const [uploadTarget, setUploadTarget] = useState<{ shotId: string; slotKey: string } | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Board order is its own thing — see orderedStoryboardShots.
+  const shots = orderedStoryboardShots(activeSetup);
+  const cameras = activeSetup.elements.filter((element) => element.type === 'camera') as CameraElement[];
+  const ratioValue = (activeSetup.aspectRatio || '16:9') as AspectRatio;
+  const ratio = ASPECT_RATIOS.find((entry) => entry.value === ratioValue)?.ratio || 16 / 9;
+
+  const setImage = (shot: Shot, slotKey: string, image: string | undefined) =>
+    updateShot(shot.id, setFramePatch(shot, slotKey, image ? { image, fit: 'cover' } : null));
+
+  const toggleFit = (shot: Shot, slot: FrameSlot) =>
+    updateShot(
+      shot.id,
+      setFramePatch(shot, slot.key, { fit: slot.frame?.fit === 'contain' ? 'cover' : 'contain' })
+    );
+
+  const handleImageFile = (shot: Shot, slotKey: string, file: File) => {
+    // Downscaled on the way in so a phone-sized photo can't blow the quota.
+    loadStoryboardImageFile(file)
+      .then((dataUrl) => setImage(shot, slotKey, dataUrl))
+      .catch(() => { void notice({ title: isZh ? '无法读取图片' : 'Image unreadable', message: isZh ? '无法读取该图片。' : 'That image could not be read.' }); });
+  };
+
+  const handleDrop = (index: number) => {
+    if (draggedIndex !== null && draggedIndex !== index) {
+      // Rearranging frames only moves the board — the shot list keeps its order.
+      const ids = shots.map((shot) => shot.id);
+      const [moved] = ids.splice(draggedIndex, 1);
+      ids.splice(index, 0, moved);
+      setStoryboardOrder(ids);
+    }
+    setDraggedIndex(null);
+    setDragOverIndex(null);
+  };
+
+  const card = 'bg-white dark:bg-slate-800/60 border-line text-ink';
+  const control = `rounded-lg border px-2 py-1 text-[11px] ${
+    'bg-field border-line-strong text-ink'
+  }`;
+
+  /** One storyboard frame: the art (or a blank drop target) plus its controls. */
+  const renderFrame = (
+    shot: Shot,
+    slot: FrameSlot,
+    showLabel: boolean,
+    camera?: CameraElement | null
+  ) => {
+    const image = slot.frame?.image;
+    const fit = slot.frame?.fit || 'cover';
+    const isStart = slot.key === START_SLOT;
+
+    return (
+      <div
+        key={slot.key}
+        className={`relative w-full bg-slate-200 dark:bg-slate-950`}
+        style={{ aspectRatio: String(ratio) }}
+        onDragOver={(event) => event.preventDefault()}
+        onDrop={(event) => {
+          const file = event.dataTransfer?.files?.[0];
+          if (file && file.type.startsWith('image/')) {
+            event.preventDefault();
+            event.stopPropagation();
+            handleImageFile(shot, slot.key, file);
+          }
+        }}
+      >
+        {image ? (
+          <ProjectImage
+            imageRef={image}
+            alt={isZh ? `镜头 ${shot.shotNumber} 的${storyboardSlotLabel(slot.label, lang)}画面` : `${slot.label} frame for shot ${shot.shotNumber}`}
+            className="absolute inset-0 w-full h-full"
+            style={{ objectFit: fit }}
+          />
+        ) : (
+          // A keyframe without artwork keeps its frame — blank on purpose
+          <button
+            onClick={(event) => {
+              event.stopPropagation();
+              setUploadTarget({ shotId: shot.id, slotKey: slot.key });
+              fileInputRef.current?.click();
+            }}
+            className={`absolute inset-0 flex flex-col items-center justify-center gap-1 text-[10px] ${
+              'text-ink-muted hover:text-ink'
+            }`}
+          >
+            <Upload className="w-4 h-4" />
+            <span>{showLabel ? storyboardSlotLabel(slot.label, lang) : (isZh ? '拖放或点击添加画面' : 'Drop or click to add art')}</span>
+          </button>
+        )}
+
+        {showLabel && (
+          <span
+            className={`absolute bottom-1.5 left-1.5 px-1.5 py-0.5 rounded text-[10px] font-mono font-bold ${
+              slot.short === 'END'
+                ? 'bg-amber-500 text-black'
+                : slot.short === 'START'
+                  ? 'bg-accent text-white'
+                  : 'bg-accent text-white'
+            }`}
+          >
+            {isZh ? storyboardSlotLabel(slot.label, lang) : (slot.short || slot.label)}
+          </span>
+        )}
+
+        {/* Quick omit button for waypoint frames without art */}
+        {!isStart && !image && (
+          <button
+            onClick={(event) => {
+              event.stopPropagation();
+              updateShot(shot.id, setSlotOmittedPatch(shot, slot.key, true, camera, hideBlankWaypoints));
+            }}
+            title={isZh ? '从故事板省略此路径节点画面' : 'Omit this waypoint picture from storyboard'}
+            className="absolute top-1.5 right-1.5 px-1.5 py-0.5 rounded bg-black/60 hover:bg-black/80 text-white/90 hover:text-white text-[10px] font-semibold flex items-center gap-1 z-10"
+          >
+            <EyeOff className="w-2.5 h-2.5" />
+            <span>{isZh ? '省略' : 'Omit'}</span>
+          </button>
+        )}
+
+        {image && (
+          <div className="absolute bottom-1.5 right-1.5 flex gap-1">
+            <button
+              onClick={(event) => {
+                event.stopPropagation();
+                toggleFit(shot, slot);
+              }}
+              title={fit === 'contain' ? (isZh ? '铺满画框' : 'Fill the frame') : (isZh ? '显示完整图片' : 'Fit the whole image')}
+              className="px-1.5 py-0.5 rounded-md bg-black/60 text-white text-[10px] font-semibold"
+            >
+              {fit === 'contain' ? (isZh ? '铺满' : 'Fit') : (isZh ? '适应' : 'Fill')}
+            </button>
+            <button
+              onClick={(event) => {
+                event.stopPropagation();
+                setUploadTarget({ shotId: shot.id, slotKey: slot.key });
+                fileInputRef.current?.click();
+              }}
+              title={isZh ? '替换图片' : 'Replace image'}
+              aria-label={isZh ? '替换图片' : 'Replace image'}
+              className="p-1 rounded-md bg-black/60 text-white"
+            >
+              <Upload className="w-3 h-3" />
+            </button>
+            {!isStart && (
+              <button
+                onClick={(event) => {
+                  event.stopPropagation();
+                  updateShot(shot.id, setSlotOmittedPatch(shot, slot.key, true, camera, hideBlankWaypoints));
+                }}
+                title={isZh ? '从故事板省略此路径节点画面（保留图片）' : 'Omit this waypoint picture from storyboard (keeps artwork safe)'}
+                aria-label={isZh ? '从故事板省略此路径节点画面（保留图片）' : 'Omit this waypoint picture from storyboard (keeps artwork safe)'}
+                className="p-1 rounded-md bg-black/60 hover:bg-black/80 text-white"
+              >
+                <EyeOff className="w-3 h-3" />
+              </button>
+            )}
+            <button
+              onClick={(event) => {
+                event.stopPropagation();
+                setImage(shot, slot.key, undefined);
+              }}
+              title={isZh ? '移除图片' : 'Remove image'}
+              aria-label={isZh ? '移除图片' : 'Remove image'}
+              className="p-1 rounded-md bg-black/60 text-white"
+            >
+              <X className="w-3 h-3" />
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div className={`h-full flex flex-col min-h-0 bg-surface text-ink`}>
+      {/* Header */}
+      <div className={`p-2.5 border-b flex flex-wrap items-center gap-2 ${isLight ? 'border-slate-200 bg-slate-50' : 'border-slate-800'}`}>
+        <PanelTitle
+          className="mr-auto"
+          icon={<ImageIcon />}
+          title={isZh ? '故事板' : 'Storyboard'}
+          count={shots.length}
+          subtitle={isZh ? '每个摄影机关键帧对应一个画面 · 拖动可调整故事板顺序（不影响镜头表顺序）' : 'One frame per camera keyframe · drag to arrange (the shot list keeps its own order)'}
+        />
+
+        {/* Aspect ratio of every frame (and of the storyboards on the plan) */}
+        <label className="flex items-center gap-1" title={isZh ? '故事板画幅比例' : 'Storyboard aspect ratio'}>
+          <Maximize2 className="w-3.5 h-3.5 opacity-60" />
+          <select
+            value={ratioValue}
+            onChange={(event) => updateSetupMeta({ aspectRatio: event.target.value as AspectRatio })}
+            className={control}
+          >
+            {ASPECT_RATIOS.map((entry) => (
+              <option key={entry.value} value={entry.value}>
+                {entry.value}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        {/* Toggle to leave out / include blank waypoint frames */}
+        <button
+          onClick={() =>
+            updateDisplaySettings({ hideBlankStoryboardWaypoints: !hideBlankWaypoints })
+          }
+          title={
+            hideBlankWaypoints
+              ? (isZh ? '当前已省略所有镜头中的空白路径节点。点击显示全部未绘制关键帧。' : 'Currently omitting blank waypoint frames across all shots. Click to show all unboarded keyframes.')
+              : (isZh ? '点击从故事板省略未绘制的路径节点画面。' : 'Click to omit unboarded waypoint frames from the storyboard.')
+          }
+          aria-pressed={hideBlankWaypoints}
+          className={`px-2 py-1.5 rounded-lg border text-[11px] font-semibold flex items-center gap-1.5 transition-colors ${
+            hideBlankWaypoints
+              ? 'bg-accent text-white border-violet-500 shadow-xs'
+              : isLight
+                ? 'border-slate-300 hover:bg-slate-100 text-slate-700'
+                : 'border-slate-700 hover:bg-slate-800 text-slate-300'
+          }`}
+        >
+          <Layers className="w-3.5 h-3.5" />
+          <span>{hideBlankWaypoints ? (isZh ? '已省略空白路径节点' : 'Blank waypoints omitted') : (isZh ? '省略空白路径节点' : 'Omit blank waypoints')}</span>
+        </button>
+
+        <PdfExportButton onClick={() => openExportModal('storyboard')} title={isZh ? '下载故事板 PDF' : 'Download the storyboard as a PDF'} />
+
+        <button
+          onClick={() => createCameraAndShot()}
+          title={isZh ? '添加画面，同时在镜头表和俯视图中创建对应镜头与摄影机' : 'Add a frame — also adds the shot to the list and its camera to the floor plan'}
+          className="px-2.5 py-1.5 rounded-lg bg-accent hover:bg-accent-hover text-white text-[11px] font-semibold flex items-center gap-1"
+        >
+          <Plus className="w-3.5 h-3.5" /> {isZh ? '添加画面' : 'Add frame'}
+        </button>
+      </div>
+
+      {/* Frames */}
+      <div className="flex-1 overflow-y-auto custom-scrollbar p-2.5">
+        {shots.length === 0 ? (
+          <div className={`m-2 p-6 text-center border border-dashed rounded-xl border-line-strong`}>
+            <ImageIcon className="w-8 h-8 mx-auto mb-2 opacity-40" />
+            <p className="text-xs font-semibold">{isZh ? '尚无故事板画面' : 'No frames yet'}</p>
+            <p className="text-[11px] opacity-60 mt-1">
+              {isZh ? '“添加画面”会创建镜头并将摄影机放到俯视图中。在镜头表或剧本中添加的镜头也会显示在这里，拖入图片前保持空白。' : '“Add frame” creates a shot with its camera on the floor plan. Shots added in the shot list or from the script show up here too — blank until you drop artwork on them.'}
+            </p>
+          </div>
+        ) : (
+          <div className="grid gap-2.5 [grid-template-columns:repeat(auto-fill,minmax(210px,1fr))]">
+            {shots.map((shot: Shot, index) => {
+              const camera = cameras.find((item) => item.id === shot.cameraId);
+              const isSelected = selectedShotId === shot.id;
+              const isDragging = draggedIndex === index;
+              const isDragOver = dragOverIndex === index && draggedIndex !== index;
+              const isWaypointsOpen = openWaypointsShotId === shot.id;
+
+              // All slots vs visible slots
+              const allSlots = slotsOf(shot, camera);
+              const slots = visibleStoryboardSlots(shot, camera, hideBlankWaypoints);
+              const hiddenWaypointCount = allSlots.length - slots.length;
+
+              return (
+                <div
+                  key={shot.id}
+                  id={`storyboard-frame-${shot.id}`}
+                  ref={isWaypointsOpen ? waypointsCardRef : undefined}
+                  onDragOver={(event) => {
+                    event.preventDefault();
+                    setDragOverIndex(index);
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    handleDrop(index);
+                  }}
+                  onDragEnd={() => {
+                    setDraggedIndex(null);
+                    setDragOverIndex(null);
+                  }}
+                  onClick={() => selectShot(shot.id, true)}
+                  className={`relative border rounded-xl overflow-hidden flex flex-col transition-all cursor-pointer ${card} ${
+                    isSelected ? 'ring-2 ring-sky-500/70' : ''
+                  } ${isDragging ? 'opacity-40' : ''} ${isDragOver ? 'ring-2 ring-violet-500' : ''}`}
+                >
+                  {/* Waypoints Frame Manager Popover */}
+                  {isWaypointsOpen && (
+                    <div
+                      onClick={(e) => e.stopPropagation()}
+                      className={`absolute z-30 inset-x-1.5 top-1.5 rounded-xl p-2.5 shadow-2xl border flex flex-col gap-2 backdrop-blur-md ${
+                        isLight
+                          ? 'bg-white/95 border-slate-300 text-slate-900 shadow-slate-400/40'
+                          : 'bg-slate-900/95 border-slate-700 text-slate-100 shadow-black/80'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between border-b pb-1.5 border-slate-200 dark:border-slate-800">
+                        <div className="flex items-center gap-1.5">
+                          <SlidersHorizontal className="w-3.5 h-3.5 text-violet-500" />
+                          <span className="text-[11px] font-bold uppercase tracking-wider">{isZh ? '构图节拍' : 'Framing Beats'}</span>
+                        </div>
+                        <button
+                          onClick={() => setOpenWaypointsShotId(null)}
+                          title={isZh ? '关闭构图节拍面板' : 'Close the framing beats panel'}
+                          aria-label={isZh ? '关闭构图节拍面板' : 'Close the framing beats panel'}
+                          className="p-1 rounded-md text-slate-400 hover:text-slate-200"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+
+                      {/* Presets */}
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => updateShot(shot.id, setSlotsPresetPatch(shot, camera, 'all'))}
+                          title={isZh ? '显示全部路径节点关键帧' : 'Show all waypoint keyframes'}
+                          className="flex-1 px-1.5 py-1 rounded-md text-[10px] font-semibold border border-slate-300 dark:border-slate-700 hover:bg-violet-500/10 hover:border-violet-500 transition-colors text-center"
+                        >
+                          {isZh ? '全部' : 'All'} ({allSlots.length})
+                        </button>
+                        <button
+                          onClick={() => updateShot(shot.id, setSlotsPresetPatch(shot, camera, 'start-end'))}
+                          title={isZh ? '仅显示起始和结束构图（省略中间节拍）' : 'Only show the start framing and end framing (omit intermediate beats)'}
+                          className="flex-1 px-1.5 py-1 rounded-md text-[10px] font-semibold border border-slate-300 dark:border-slate-700 hover:bg-violet-500/10 hover:border-violet-500 transition-colors text-center"
+                        >
+                          {isZh ? '起始与结束' : 'Start & End'}
+                        </button>
+                        <button
+                          onClick={() => updateShot(shot.id, setSlotsPresetPatch(shot, camera, 'omit-blank'))}
+                          title={isZh ? '省略此镜头中未绘制的路径节点画面' : 'Omit unboarded waypoint frames on this shot'}
+                          className="flex-1 px-1.5 py-1 rounded-md text-[10px] font-semibold border border-slate-300 dark:border-slate-700 hover:bg-violet-500/10 hover:border-violet-500 transition-colors text-center"
+                        >
+                          {isZh ? '已有画面' : 'With Art'}
+                        </button>
+                      </div>
+
+                      {/* Keyframes checklist */}
+                      <div className="flex flex-col gap-1 max-h-40 overflow-y-auto custom-scrollbar pr-0.5">
+                        {allSlots.map((s) => {
+                          const isOmitted = isSlotOmitted(shot, s.key, hideBlankWaypoints, s.frame?.image);
+                          const isStart = s.key === START_SLOT;
+                          const hasArt = !!s.frame?.image;
+
+                          return (
+                            <div
+                              key={s.key}
+                              onClick={() => {
+                                if (isStart) return;
+                                updateShot(
+                                  shot.id,
+                                  toggleSlotOmittedPatch(shot, s.key, camera, hideBlankWaypoints)
+                                );
+                              }}
+                              className={`flex items-center justify-between p-1.5 rounded-lg text-[10px] transition-colors ${
+                                isStart
+                                  ? 'opacity-80 cursor-default bg-slate-500/10'
+                                  : isOmitted
+                                    ? 'bg-slate-500/5 text-ink-muted hover:bg-slate-500/10 cursor-pointer'
+                                    : 'bg-violet-500/10 font-semibold text-violet-700 dark:text-violet-300 hover:bg-violet-500/20 cursor-pointer'
+                              }`}
+                            >
+                              <div className="flex items-center gap-1.5">
+                                <span
+                                  className={`w-3.5 h-3.5 rounded border flex items-center justify-center text-[10px] font-bold ${
+                                    !isOmitted
+                                      ? 'bg-accent text-white border-violet-500'
+                                      : 'border-slate-500 text-transparent'
+                                  }`}
+                                >
+                                  ✓
+                                </span>
+                                <span className="font-mono font-bold">
+                                  {isZh ? storyboardSlotLabel(s.label, lang) : (s.short || s.label)}
+                                </span>
+                                {!isZh && <span>{s.label}</span>}
+                              </div>
+
+                              <div className="flex items-center gap-1 font-mono text-[10px]">
+                                {hasArt ? (
+                                  <span className="text-ok font-semibold">{isZh ? '有画面' : 'Art'}</span>
+                                ) : (
+                                  <span className="text-slate-500">{isZh ? '空白' : 'Blank'}</span>
+                                )}
+                                {!isStart && (
+                                  <span className={isOmitted ? 'text-warn font-semibold' : 'text-slate-400'}>
+                                    {isOmitted ? (isZh ? '已省略' : 'Omitted') : (isZh ? '显示' : 'Shown')}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* One frame per camera keyframe */}
+                  <div className="relative">
+                    {slots.length > 1 ? (
+                      <div className="flex flex-col gap-1.5 p-1 bg-slate-700/40">
+                        {slots.map((slot) => renderFrame(shot, slot, true, camera))}
+                      </div>
+                    ) : (
+                      renderFrame(shot, slots[0], allSlots.length > 1, camera)
+                    )}
+
+                    {/* Hidden blank/omitted waypoints indicator */}
+                    {hiddenWaypointCount > 0 && (
+                      <div
+                        className={`px-2 py-1 flex items-center justify-between text-[10px] border-b ${
+                          'bg-slate-100/90 dark:bg-slate-950/80 border-line text-ink-soft'
+                        }`}
+                      >
+                        <span className="font-mono flex items-center gap-1">
+                          <Layers className="w-3 h-3 text-warn" />
+                          {isZh ? `已省略 ${hiddenWaypointCount} 个路径节点` : `${hiddenWaypointCount} waypoint${hiddenWaypointCount === 1 ? '' : 's'} omitted`}
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setOpenWaypointsShotId(shot.id);
+                            }}
+                            title={isZh ? '管理要显示的路径节点画面' : 'Manage exactly which waypoint frames are shown'}
+                            className="text-accent-ink hover:text-sky-400 font-semibold underline underline-offset-2"
+                          >
+                            {isZh ? '管理' : 'Manage'}
+                          </button>
+                          <span className="opacity-30">·</span>
+                          <button
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              updateShot(shot.id, setSlotsPresetPatch(shot, camera, 'all'));
+                            }}
+                            title={isZh ? '显示此镜头的全部路径节点画面' : 'Show all waypoint frames for this shot'}
+                            className="text-slate-400 hover:text-slate-200 font-semibold"
+                          >
+                            {isZh ? '全部显示' : 'Show all'}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* What the move is, between the keyframes */}
+                    {slots.length > 1 && shotHasMove(shot) && (
+                      <span className="absolute top-1 left-1/2 -translate-x-1/2 z-10 px-1.5 py-0.5 rounded-full bg-black/75 text-white text-[10px] font-bold flex items-center gap-1 pointer-events-none">
+                        <ArrowRight className="w-3 h-3" />
+                        {cameraMovementLabel(shot.movement, lang)}
+                      </span>
+                    )}
+
+                    <div className="absolute top-1.5 left-1.5 flex items-center gap-1 z-10">
+                      <span className="px-1.5 py-0.5 rounded-md bg-black/70 text-white text-[10px] font-mono font-bold">
+                        {shot.shotNumber}
+                      </span>
+                      {camera && (
+                        <span
+                          className="px-1.5 py-0.5 rounded-md text-[10px] font-mono font-bold text-white flex items-center gap-1"
+                          style={{ background: camera.color || '#0ea5e9' }}
+                        >
+                          <Camera className="w-2.5 h-2.5" />
+                          {(camera.cameraLabel || 'A').toUpperCase()}
+                        </span>
+                      )}
+                      {shot.movement && (
+                        <span className="px-1.5 py-0.5 rounded-md bg-amber-500 text-black text-[10px] font-bold shadow-xs">
+                          {cameraMovementLabel(shot.movement, lang)}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="absolute top-1.5 right-1.5 flex items-center gap-1 z-10">
+                      {/* Waypoints Framing Beats button when camera has moves */}
+                      {allSlots.length > 1 && (
+                        <button
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setOpenWaypointsShotId(isWaypointsOpen ? null : shot.id);
+                          }}
+                          title={isZh ? `管理路径节点画面（${slots.length}/${allSlots.length} 启用）` : `Manage waypoint frames (${slots.length}/${allSlots.length} active)`}
+                          aria-label={isZh ? `管理路径节点画面（${slots.length}/${allSlots.length} 启用）` : `Manage waypoint frames (${slots.length}/${allSlots.length} active)`}
+                          aria-expanded={isWaypointsOpen}
+                          className={`p-1 rounded-md text-[10px] font-mono font-bold flex items-center gap-1 transition-colors ${
+                            slots.length < allSlots.length
+                              ? 'bg-amber-500 text-black shadow-xs'
+                              : 'bg-black/60 text-white hover:bg-black/80'
+                          }`}
+                        >
+                          <SlidersHorizontal className="w-3 h-3" />
+                          <span>{slots.length}/{allSlots.length}</span>
+                        </button>
+                      )}
+
+                      {/* Shoot this frame with the device camera through the finder */}
+                      {shot.cameraId && (
+                        <button
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            selectShot(shot.id, true);
+                            openViewfinder(shot.cameraId);
+                          }}
+                          title={isZh ? '打开此镜头的取景器，并用当前设备拍摄故事板照片' : "Open the viewfinder for this shot — take a storyboard photo with this device's camera"}
+                          aria-label={isZh ? '打开此镜头的取景器，并用当前设备拍摄故事板照片' : "Open the viewfinder for this shot — take a storyboard photo with this device's camera"}
+                          className="p-1 rounded-md bg-black/60 text-white hover:bg-black/80"
+                        >
+                          <Video className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                      <div
+                        draggable
+                        onDragStart={(event) => {
+                          event.stopPropagation();
+                          setDraggedIndex(index);
+                        }}
+                        title={isZh ? '拖动排序' : 'Drag to reorder'}
+                        className="p-1 rounded-md bg-black/60 text-white cursor-grab active:cursor-grabbing"
+                      >
+                        <GripVertical className="w-3.5 h-3.5" />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Description, editable from the board */}
+                  <div className="p-2 flex flex-col gap-1.5 flex-1">
+                    <input
+                      value={generatedProjectTextLabel(shot.name, lang)}
+                      onClick={(event) => event.stopPropagation()}
+                      onChange={(event) => updateShot(shot.id, { name: event.target.value })}
+                      placeholder={isZh ? '镜头名称' : 'Shot name'}
+                      className={`w-full text-[11px] font-semibold bg-transparent border-b border-transparent focus:border-sky-500 focus:outline-none ${
+                        'text-ink'
+                      }`}
+                    />
+                    <textarea
+                      value={generatedProjectTextLabel(shot.framingDescription, lang)}
+                      onClick={(event) => event.stopPropagation()}
+                      onChange={(event) => updateShot(shot.id, { framingDescription: event.target.value })}
+                      rows={2}
+                      placeholder={isZh ? '说明：构图、动作、摄影机运动…' : 'Description — framing, action, camera move…'}
+                      className={`w-full text-[11px] leading-snug rounded-lg border p-1.5 resize-y ${
+                        'bg-surface-sunken border-line'
+                      }`}
+                    />
+                    {shot.actionScriptNotes && (
+                      <p
+                        title={shot.actionScriptNotes}
+                        className={`text-[10px] leading-snug rounded-lg px-1.5 py-1 line-clamp-3 ${
+                          'bg-violet-50 dark:bg-violet-500/10 text-violet-900 dark:text-violet-200'
+                        }`}
+                      >
+                        <span className="font-bold uppercase tracking-wide opacity-70">{isZh ? '来自剧本 · ' : 'From script · '}</span>
+                        {shot.actionScriptNotes}
+                      </p>
+                    )}
+
+                    <div className="flex items-center justify-between mt-auto pt-0.5">
+                      <span className={`text-[10px] font-mono text-ink-muted`}>
+                        {shotSizeLabel(shot.shotSize, lang)} · {shot.lensMm}mm{shot.movement ? ` · ${cameraMovementLabel(shot.movement, lang)}` : ''}
+                      </span>
+                      <button
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          deleteShot(shot.id);
+                        }}
+                        title={isZh ? '删除此镜头（同时从镜头表和俯视图移除对应摄影机）' : 'Delete this shot (removes it from the shot list and its camera from the plan)'}
+                        aria-label={isZh ? '删除此镜头（同时从镜头表和俯视图移除对应摄影机）' : 'Delete this shot (removes it from the shot list and its camera from the plan)'}
+                        className="p-1 rounded text-rose-500 hover:bg-rose-500/10"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          const shot = uploadTarget && shots.find((item) => item.id === uploadTarget.shotId);
+          if (file && uploadTarget && shot) handleImageFile(shot, uploadTarget.slotKey, file);
+          setUploadTarget(null);
+          event.target.value = '';
+        }}
+      />
+    </div>
+  );
+};

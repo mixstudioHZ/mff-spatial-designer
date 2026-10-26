@@ -1,0 +1,1148 @@
+import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
+import { GettingStarted } from './GettingStarted';
+import { useDismiss } from '../common/useDismiss';
+import { LANGUAGE_SWITCHING_ENABLED } from '../../config/features';
+import { updateProductionDetailsCommand } from '../../domain/commands';
+import { useFloorPlan } from '../../context/FloorPlanContext';
+import type { CategoryOpacitySettings } from '../../context/FloorPlanContext';
+
+/**
+ * The element categories with an opacity slider, keyed to the settings object
+ * so a renamed field fails here rather than writing an opacity nothing reads.
+ */
+const OPACITY_CATEGORIES: Array<{ key: keyof CategoryOpacitySettings; label: string }> = [
+  { key: 'actors', label: 'Actors & Talent' },
+  { key: 'cameras', label: 'Cameras & Cones' },
+  { key: 'lights', label: 'Lights & Beams' },
+  { key: 'props', label: 'Props' },
+  { key: 'architecture', label: 'Walls & Doors' },
+  { key: 'shapes', label: 'Basic Shapes' },
+];
+import { useBreakpoint } from '../../utils/useMediaQuery';
+import { BRANDING } from '../../config/branding';
+import { APP_VERSION, SPONSOR_LINKS } from '../../config/version';
+import { subscribeSaveState, type LibrarySaveState } from '../../utils/projectLibrary';
+import { useDialogs } from '../dialog/DialogProvider';
+import {
+  applyAssetRemap,
+  getBoundProjectFileName,
+  getLastNativeSaveAt,
+  parseProjectFileBytes,
+} from '../../utils/nativeProjectFile';
+import { MODULE_PICKER_GROUPS, PICKABLE_MODULES } from '../../domain/workspace';
+import {
+  ChevronDown,
+  Clapperboard,
+  Coffee,
+  Download,
+  Eye,
+  FolderOpen,
+  Heart,
+  History,
+  Magnet,
+  LayoutGrid,
+  Languages,
+  MoreHorizontal,
+  Moon,
+  Plus,
+  FileDown,
+  Redo2,
+  Save,
+  Sparkles,
+  Sun,
+  Trash2,
+  Undo2,
+} from 'lucide-react';
+import { downloadBlob, downloadText, safeFileName } from '../../utils/download';
+import { exportProjectPackageV2 } from '../../utils/projectPackageV2';
+import { recordBackup } from '../../utils/cloud/backupHistory';
+import { useWorkspaceUI } from '../../context/WorkspaceUIContext';
+import { useLanguage } from '../../i18n/LanguageContext';
+
+/** On-set mode is a full-screen tool opened on the day; it loads on demand. */
+const OnSetModeOverlay = lazy(() => import('../onset/OnSetModeOverlay').then((m) => ({ default: m.OnSetModeOverlay })));
+
+
+export const TopNavbar: React.FC = () => {
+  const { project, activeSetup, historyIndex, historyLength, undo, redo, setActiveSetupId, addSetup, duplicateCurrentSetup, deleteSetup, runCommand, saveRevision, loadTemplateScene, loadExampleProductionData, loadProjectFromJson, setGridSettings, openViewfinder, displaySettings, updateDisplaySettings, isModuleVisible, setModuleVisible } = useFloorPlan();
+  const { theme, toggleTheme, openExportModal, openDashboard } = useWorkspaceUI();
+  const { confirm, notice, prompt } = useDialogs();
+  const { lang, setLang, t } = useLanguage();
+
+  const [isTemplatesOpen, setIsTemplatesOpen] = useState(false);
+  /** Transient confirmation after filling empty modules with examples. */
+  const [exampleFillMessage, setExampleFillMessage] = useState<string | null>(null);
+  const [isSetupsOpen, setIsSetupsOpen] = useState(false);
+  const [isViewingOptionsOpen, setIsViewingOptionsOpen] = useState(false);
+  const [isOverflowOpen, setIsOverflowOpen] = useState(false);
+  // Every dropdown closes on Escape or a click outside it (and arrows move inside).
+  const setupsMenuRef = useRef<HTMLDivElement>(null);
+  const templatesMenuRef = useRef<HTMLDivElement>(null);
+  const viewingMenuRef = useRef<HTMLDivElement>(null);
+  const overflowMenuRef = useRef<HTMLDivElement>(null);
+  useDismiss(isSetupsOpen, useCallback(() => setIsSetupsOpen(false), []), setupsMenuRef);
+  useDismiss(isTemplatesOpen, useCallback(() => setIsTemplatesOpen(false), []), templatesMenuRef);
+  useDismiss(isViewingOptionsOpen, useCallback(() => setIsViewingOptionsOpen(false), []), viewingMenuRef);
+  useDismiss(isOverflowOpen, useCallback(() => setIsOverflowOpen(false), []), overflowMenuRef);
+  /** Save menu (.osd pre-selected, JSON one switch away) and its format. */
+  const [isSaveMenuOpen, setIsSaveMenuOpen] = useState(false);
+  const [saveFormat, setSaveFormat] = useState<'osd' | 'json'>('osd');
+  /** On-set / show-day mode overlay (plan §35) — local UI state, not persisted. */
+  const [isOnSetMode, setIsOnSetMode] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const { isCompact } = useBreakpoint();
+
+  const gridSettings = activeSetup?.gridSettings || { size: 30, snap: true, showGrid: false, unit: 'm', pixelsPerUnit: 30 };
+
+  // Handle Export JSON Project file.
+  // Uses a Blob download so projects with many embedded (base64 data-URL)
+  // storyboard images export reliably regardless of size.
+  const handleExportJson = () => {
+    // The sanitiser here replaced whitespace only, so a project called
+    // `Ocean's 11: Director/Draft "2"` produced a download name containing a
+    // slash, a colon and quotes — illegal on Windows, and a path separator.
+    downloadText(
+      JSON.stringify(project, null, 2),
+      `${safeFileName(project.title, 'project').toLowerCase()}_openshotdesigner.json`,
+      { type: 'application/json' },
+    );
+    recordBackup();
+  };
+
+  /** Instant .osd download: project + all images, the backup to take. */
+  const handleExportOsd = () => {
+    void (async () => {
+      try {
+        const blob = await exportProjectPackageV2(project);
+        downloadBlob(blob, `${safeFileName(project.title, 'project').toLowerCase()}.osd`);
+        recordBackup();
+      } catch (err) {
+        await notice({
+          title: 'Project save failed',
+          message: err instanceof Error ? err.message : 'unknown error',
+        });
+      }
+    })();
+  };
+
+  const runSaveMenu = () => {
+    setIsSaveMenuOpen(false);
+    if (saveFormat === 'json') handleExportJson();
+    else handleExportOsd();
+  };
+
+  // Handle Import JSON Project file
+  const handleImportJson = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    // Bytes, not text: .osd v2 packages are ZIP archives. Unversioned JSON
+    // backups keep working through the same path.
+    void (async () => {
+      try {
+        const parsed = await parseProjectFileBytes(await file.arrayBuffer());
+        const remapped = await parsed.importAssets();
+        const result = loadProjectFromJson(applyAssetRemap(parsed.project, remapped));
+        if (!result.ok) {
+          await notice({ title: 'Import failed', message: result.message });
+        }
+      } catch (err) {
+        await notice({
+          title: 'Import failed',
+          message: err instanceof Error ? err.message : `Invalid ${BRANDING.productName} project file.`,
+        });
+      }
+    })();
+    e.target.value = '';
+  };
+
+  const isLight = theme === 'light';
+
+  // Local-first autosave status (plan §5.5): reflects the project library's
+  // persistence queue — distinct from shared/collaborative sync state.
+  const [saveState, setSaveState] = useState<LibrarySaveState>('idle');
+  useEffect(() => subscribeSaveState(setSaveState), []);
+  const overflowItemClass = `w-full px-2.5 py-2 rounded-lg text-xs flex items-center justify-between transition-colors ${
+    'hover:bg-surface-hover'
+  }`;
+
+  return (
+    <header
+      id="top-navbar"
+      aria-label="Project and workspace actions"
+      className={`${isCompact ? 'h-12 px-2 gap-1.5' : 'h-14 px-4 gap-3'} border-b flex items-center justify-between select-none z-30 transition-colors ${
+        'bg-surface border-line text-ink'
+      }`}
+    >
+      {/* 1. App Logo & Project Title */}
+      <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+        <button
+          onClick={openDashboard}
+          title={t('nav.dashboard')}
+          aria-label={t('nav.dashboard')}
+          className="p-2 rounded-lg border border-transparent transition-colors text-ink-muted hover:text-ink hover:bg-surface-hover flex-shrink-0"
+        >
+          <LayoutGrid className="w-4 h-4" />
+        </button>
+<div className="hidden sm:flex items-center gap-2">
+            <div aria-hidden className="w-8 h-8 shrink-0 rounded-md bg-emerald-700 text-white grid place-items-center shadow-md ring-1 ring-emerald-400/30">
+              <Clapperboard className="w-4.5 h-4.5" />
+            </div>
+            <div className="hidden 2xl:block">
+              <div className="flex items-center gap-1.5">
+                <span className={`text-xs font-black tracking-widest uppercase text-ink whitespace-nowrap`}>
+                  {BRANDING.productName}
+                </span>
+              </div>
+              {/* Discrete version stamp: always visible, never in the way. */}
+              <div className="flex items-center gap-1.5 -mt-0.5">
+                <span
+                  title={`${BRANDING.productName} v${APP_VERSION}`}
+                  className={`text-[10px] font-mono leading-none text-ink-subtle`}
+                >
+                  v{APP_VERSION}
+                </span>
+              </div>
+            </div>
+          </div>
+
+        <div className={`h-5 w-[1px] hidden sm:block bg-surface-muted`} />
+
+        {/* Project Title Input */}
+        <input
+          type="text"
+          value={project.title}
+          onChange={(e) => runCommand(updateProductionDetailsCommand, { updates: { title: e.target.value } })}
+          className={`text-xs font-semibold px-2 py-1 rounded-lg border border-transparent focus:border-sky-500 focus:outline-none transition-colors hidden sm:block max-w-[180px] sm:max-w-xs truncate ${
+            'text-ink-soft hover:bg-surface-hover focus:bg-field'
+          }`}
+          title={t('nav.rename')}
+          aria-label="Project title"
+        />
+
+        {saveState === 'saving' && (
+          <span className={`hidden md:inline whitespace-nowrap text-[10px] font-medium px-1.5 py-0.5 rounded text-warn bg-warn-soft`}>
+            {t('save.saving')}
+          </span>
+        )}
+        {saveState === 'saved' && (
+          <span
+            title={getBoundProjectFileName(project.id) ? 'Saved in this browser' : 'Saved in this browser only — press Ctrl+S to also save a .osd file'}
+            className={`hidden md:inline whitespace-nowrap text-[10px] font-medium px-1.5 py-0.5 rounded text-ok bg-ok-soft`}>
+            {t('save.saved')}
+          </span>
+        )}
+        {saveState === 'error' && (
+          <span className={`hidden md:inline whitespace-nowrap text-[10px] font-medium px-1.5 py-0.5 rounded text-red-600 dark:text-red-300 bg-red-50 dark:bg-red-900/30`}>
+            {t('save.error')}
+          </span>
+        )}
+        {(() => {
+          // Bound native file state (plan §2.5): which file Ctrl+S writes to,
+          // and whether the browser holds newer changes than that file.
+          const boundFileName = getBoundProjectFileName(project.id);
+          // No file yet: the save chip's tooltip says so; a second chip only crowded the bar.
+          if (!boundFileName) return null;
+          const lastSave = getLastNativeSaveAt(project.id);
+          const dirty = !lastSave || (project.updatedAt ?? '') > lastSave;
+          return (
+            <span title={dirty ? `${boundFileName} — unsaved changes in browser` : `${boundFileName} — all changes saved`} className={`hidden lg:inline whitespace-nowrap max-w-[10rem] truncate text-[10px] font-medium px-1.5 py-0.5 rounded ${dirty ? ('text-warn bg-warn-soft') : ('text-ok bg-ok-soft')}`}>
+              {dirty ? '● ' : ''}{boundFileName}
+            </span>
+          );
+        })()}
+        {LANGUAGE_SWITCHING_ENABLED && (
+          <button
+            type="button"
+            onClick={() => setLang(lang === 'zh' ? 'en' : 'zh')}
+            title={lang === 'zh' ? t('nav.languageToEnglish') : t('nav.languageToChinese')}
+            aria-label={lang === 'zh' ? t('nav.languageToEnglish') : t('nav.languageToChinese')}
+            className="hidden md:inline-flex h-7 items-center gap-1 rounded-md border border-line-strong bg-surface-sunken px-2 text-[10px] font-bold text-ink-soft hover:bg-surface-hover"
+          >
+            <Languages className="h-3.5 w-3.5" />
+            <span>{lang === 'zh' ? 'EN' : '中'}</span>
+          </button>
+        )}
+      </div>
+
+      {/* 2. Scene / Setup Switcher Dropdown */}
+      <div className="flex items-center gap-2">
+        <div className="relative" ref={setupsMenuRef}>
+          <button
+            onClick={() => setIsSetupsOpen(!isSetupsOpen)}
+            aria-expanded={isSetupsOpen}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors ${
+              'bg-surface-sunken hover:bg-surface-hover border-line text-ink'
+            }`}
+          >
+            <span className="w-2 h-2 rounded-full bg-emerald-400" />
+            <span className="font-mono text-accent-ink font-semibold whitespace-nowrap">Sc {activeSetup.sceneNumber}</span>
+            <span className="hidden sm:inline max-w-[140px] truncate">{activeSetup.name}</span>
+            <ChevronDown className="w-3.5 h-3.5 opacity-60" />
+          </button>
+
+          {/* Setup Menu Dropdown */}
+          {isSetupsOpen && (
+            <div className={`absolute top-full left-0 mt-1.5 w-64 border rounded-xl shadow-2xl p-2 z-50 animate-in fade-in slide-in-from-top-1 ${
+              'bg-surface border-line text-ink'
+            }`}>
+              <div className="text-[10px] font-bold opacity-60 uppercase px-2 py-1">
+                Scene Setups ({project.setups.length})
+              </div>
+              <div className="max-h-56 overflow-y-auto space-y-1">
+                {project.setups.map((setup) => (
+                  <div
+                    key={setup.id}
+                    className={`w-full px-2 py-1.5 rounded-lg text-xs flex items-center justify-between group transition-colors ${
+                      setup.id === activeSetup.id
+                        ? 'bg-accent text-white font-semibold'
+                        : 'text-ink-soft hover:bg-surface-hover'
+                    }`}
+                  >
+                    <button
+                      onClick={() => {
+                        setActiveSetupId(setup.id);
+                        setIsSetupsOpen(false);
+                      }}
+                      className="flex-1 text-left truncate flex items-center gap-1.5"
+                    >
+                      <span
+                        className={`font-mono text-[10px] flex-shrink-0 ${
+                          setup.id === activeSetup.id ? 'text-white/80' : 'text-accent-ink'
+                        }`}
+                      >
+                        S{setup.sceneNumber || project.setups.indexOf(setup) + 1}
+                      </span>
+                      <span className="truncate">{setup.name}</span>
+                    </button>
+                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                      <span className="text-[10px] opacity-90 font-mono">
+                        {setup.shots.length} shots
+                      </span>
+                      {project.setups.length > 1 && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void confirm({
+                              title: 'Delete scene?',
+                              message: `Delete scene "${setup.name}"? Undo (Ctrl+Z) brings it back.`,
+                              confirmLabel: 'Delete',
+                              danger: true,
+                            }).then((confirmed) => {
+                              if (confirmed) deleteSetup(setup.id);
+                            });
+                          }}
+                          title="Delete this scene setup"
+                          aria-label="Delete this scene setup"
+                          className="p-1 rounded opacity-60 hover:opacity-100 hover:bg-red-500/20 text-red-400 transition-opacity"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className={`pt-2 mt-2 border-t flex flex-col gap-1 border-line`}>
+                <button
+                  onClick={() => {
+                    addSetup();
+                    setIsSetupsOpen(false);
+                  }}
+                  className="w-full text-left px-2.5 py-1 text-xs text-accent-ink hover:bg-sky-50 dark:hover:bg-slate-800 rounded flex items-center gap-1.5 font-medium"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>+ New Scene Setup</span>
+                </button>
+                <button
+                  onClick={() => {
+                    duplicateCurrentSetup();
+                    setIsSetupsOpen(false);
+                  }}
+                  className={`w-full text-left px-2.5 py-1 text-xs rounded text-ink-soft hover:bg-surface-hover`}
+                >
+                  Duplicate Current Setup
+                </button>
+                {project.setups.length > 1 && (
+                  <button
+                  onClick={() => {
+                    void confirm({
+                      title: 'Delete scene?',
+                      message: `Delete current scene "${activeSetup.name}"?`,
+                      confirmLabel: 'Delete',
+                      danger: true,
+                    }).then((confirmed) => {
+                      if (!confirmed) return;
+                      deleteSetup(activeSetup.id);
+                      setIsSetupsOpen(false);
+                    });
+                  }}
+                    className="w-full text-left px-2.5 py-1 text-xs text-red-500 hover:bg-red-500/10 rounded flex items-center gap-1.5 font-medium"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Delete Current Scene</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <GettingStarted />
+
+        {/* Templates Dropdown */}
+        <div className="relative" ref={templatesMenuRef}>
+          <button
+            onClick={() => setIsTemplatesOpen(!isTemplatesOpen)}
+            aria-expanded={isTemplatesOpen}
+            aria-label={t('nav.templates')}
+            title={t('nav.templates')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs transition-colors ${
+              'border-transparent hover:bg-surface-hover text-ink-soft'
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5 text-ink-muted" />
+            <span className="hidden xl:inline whitespace-nowrap">{t('nav.templates')}</span>
+            <ChevronDown className="w-3 h-3 opacity-60" />
+          </button>
+
+          {isTemplatesOpen && (
+            <div className={`absolute top-full left-0 mt-1.5 w-72 border rounded-xl shadow-2xl p-2 z-50 animate-in fade-in slide-in-from-top-1 ${
+              'bg-surface border-line text-ink'
+            }`}>
+              <div className="text-[10px] font-bold opacity-60 uppercase px-2 py-1">
+                Educational Presets
+              </div>
+              <button
+                onClick={() => {
+                  loadTemplateScene(0);
+                  setIsTemplatesOpen(false);
+                }}
+                className={`w-full text-left p-2 rounded-lg text-xs transition-colors ${
+                  'hover:bg-surface-hover'
+                }`}
+              >
+                <div className="font-semibold text-accent-ink">Classic 2-Person Dialogue</div>
+                <div className="text-[11px] opacity-70">
+                  Shot-Reverse-Shot with Master wide, key/fill lighting, and sofa blocking.
+                </div>
+              </button>
+              <button
+                onClick={() => {
+                  loadTemplateScene(1);
+                  setIsTemplatesOpen(false);
+                }}
+                className={`w-full text-left p-2 rounded-lg text-xs transition-colors ${
+                  'hover:bg-surface-hover'
+                }`}
+              >
+                <div className="font-semibold text-warn">Film Noir Interrogation</div>
+                <div className="text-[11px] opacity-70">
+                  Dramatic single top light, hard rim light, low angle & Dutch angle coverage.
+                </div>
+              </button>
+
+              <div className={`mt-1 pt-1 border-t border-line-strong`}>
+                <div className="text-[10px] font-bold opacity-60 uppercase px-2 py-1">
+                  Example production data
+                </div>
+                <button
+                  onClick={() => {
+                    const filled = loadExampleProductionData();
+                    setExampleFillMessage(
+                      filled.length === 0
+                        ? 'Every module already has data — nothing was changed.'
+                        : `Added example ${filled.join(', ')}.`,
+                    );
+                    setIsTemplatesOpen(false);
+                  }}
+                  className={`w-full text-left p-2 rounded-lg text-xs transition-colors ${
+                    'hover:bg-surface-hover'
+                  }`}
+                >
+                  <div className="font-semibold text-ok">Fill empty modules with examples</div>
+                  <div className="text-[11px] opacity-70">
+                    Crew, shooting days &amp; call sheets, locations, task board, mood board, run of
+                    show, logistics, rigging and power — only where this project is still empty.
+                    Nothing you already have is touched.
+                  </div>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Confirmation of what the fill actually added; dismissed by click. */}
+          {exampleFillMessage && (
+            <button
+              onClick={() => setExampleFillMessage(null)}
+              className={`absolute top-full left-0 mt-1.5 w-72 text-left border rounded-xl shadow-2xl p-2.5 z-50 text-[11px] ${
+                'bg-emerald-50 dark:bg-emerald-950 border-emerald-300 dark:border-emerald-800 text-emerald-900 dark:text-emerald-100'
+              }`}
+            >
+              {exampleFillMessage}
+              <span className="block mt-1 opacity-60">Click to dismiss · Ctrl+Z undoes it.</span>
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* 3. Undo / Redo & Viewport & Theme Controls */}
+      <div className={`flex items-center ${isCompact ? 'gap-1' : 'gap-2'}`}>
+        {/* Undo / Redo */}
+        <div className="flex items-center">
+          <button
+            onClick={undo}
+            disabled={historyIndex <= 0}
+            title={t('nav.undo')}
+            aria-label={t('nav.undo')}
+            className="p-2 rounded-lg text-ink-muted hover:text-ink hover:bg-surface-hover disabled:opacity-30 disabled:hover:bg-transparent transition-colors"
+          >
+            <Undo2 className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={redo}
+            disabled={historyIndex >= historyLength - 1}
+            title={t('nav.redo')}
+            aria-label={t('nav.redo')}
+            className="p-2 rounded-lg text-ink-muted hover:text-ink hover:bg-surface-hover disabled:opacity-30 disabled:hover:bg-transparent transition-colors"
+          >
+            <Redo2 className="w-3.5 h-3.5" />
+          </button>
+        </div>
+
+        {/* Secondary controls: inline on wide screens, in the overflow menu when narrow */}
+        {!isCompact && (
+          <>
+            {/* Snap to Grid Toggle */}
+            <button
+              onClick={() => setGridSettings({ snap: !gridSettings.snap })}
+              aria-pressed={gridSettings.snap}
+              title={gridSettings.snap ? t('nav.snapOn') : t('nav.snapOff')}
+              aria-label={gridSettings.snap ? t('nav.snapOn') : t('nav.snapOff')}
+              className={`p-2 rounded-lg border transition-colors ${
+                gridSettings.snap
+                  ? 'bg-accent-soft text-accent-ink border-transparent'
+                  : 'border-transparent text-ink-muted hover:text-ink hover:bg-surface-hover'
+              }`}
+            >
+              <Magnet className="w-3.5 h-3.5" />
+            </button>
+
+            {/* Light / Dark Mode Toggle */}
+            <button
+              id="btn-toggle-theme"
+              onClick={toggleTheme}
+              title={isLight ? t('theme.toDark') : t('theme.toLight')}
+              aria-label={isLight ? t('theme.toDark') : t('theme.toLight')}
+              className={`p-2 rounded-lg border transition-colors ${
+                'border-transparent text-ink-muted hover:text-ink hover:bg-surface-hover'
+              }`}
+            >
+              {isLight ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
+              <span className="sr-only">{isLight ? t('theme.dark') : t('theme.light')}</span>
+            </button>
+
+            {/* Viewing Options Popover */}
+            <div className="relative" ref={viewingMenuRef}>
+              <button
+                onClick={() => setIsViewingOptionsOpen(!isViewingOptionsOpen)}
+                aria-expanded={isViewingOptionsOpen}
+                aria-label={t('nav.viewing')}
+                title={t('nav.viewing')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors ${
+                  'border-transparent hover:bg-surface-hover text-ink-soft'
+                }`}
+              >
+                <Eye className="w-3.5 h-3.5 text-sky-400" />
+                <span className="hidden xl:inline whitespace-nowrap">{t('nav.viewing')}</span>
+                <ChevronDown className="w-3 h-3 opacity-60" />
+              </button>
+
+              {isViewingOptionsOpen && (
+                <div
+                  className={`absolute right-0 top-full mt-1.5 w-80 max-h-[calc(100vh-76px)] overflow-y-auto custom-scrollbar border rounded-xl shadow-2xl p-3 z-50 animate-in fade-in slide-in-from-top-1 space-y-3.5 ${
+                    'bg-surface border-line text-ink'
+                  }`}
+                >
+                  <div className="flex items-center justify-between border-b pb-2">
+                    <span className="text-xs font-bold uppercase tracking-wider text-accent-ink">
+                      Viewing & Opacity Controls
+                    </span>
+                    <button
+                      onClick={() => setIsViewingOptionsOpen(false)}
+                      title="Close viewing & opacity controls"
+                      aria-label="Close viewing & opacity controls"
+                      className="text-slate-400 hover:text-slate-200"
+                    >
+                      ✕
+                    </button>
+                  </div>
+
+                  {/* Toggles */}
+                  <div className="space-y-2 text-xs">
+                    {/* Grid toggle */}
+                    <label className="flex items-center justify-between cursor-pointer">
+                      <span className="font-semibold">Show Canvas Grid</span>
+                      <input
+                        type="checkbox"
+                        checked={displaySettings.showGrid}
+                        onChange={(e) => {
+                          const val = e.target.checked;
+                          updateDisplaySettings({ showGrid: val });
+                          setGridSettings({ showGrid: val });
+                        }}
+                        className="rounded accent-sky-500 w-4 h-4 cursor-pointer"
+                      />
+                    </label>
+
+                    {/* Snap to grid */}
+                    <label className="flex items-center justify-between cursor-pointer">
+                      <span className="font-semibold">Snap Objects to Grid</span>
+                      <input
+                        type="checkbox"
+                        checked={gridSettings.snap}
+                        onChange={(e) => setGridSettings({ snap: e.target.checked })}
+                        className="rounded accent-sky-500 w-4 h-4 cursor-pointer"
+                      />
+                    </label>
+
+                    {/* Derived planning warnings — off unless asked for */}
+                    <label className="flex items-center justify-between cursor-pointer">
+                      <span className="font-semibold">Show Planning Warnings</span>
+                      <input
+                        type="checkbox"
+                        checked={displaySettings.showPlanningWarnings === true}
+                        onChange={(e) => updateDisplaySettings({ showPlanningWarnings: e.target.checked })}
+                        className="rounded accent-sky-500 w-4 h-4 cursor-pointer"
+                      />
+                    </label>
+                    <p className={`text-[10px] -mt-1 mb-1 text-ink-muted`}>
+                      Coverage gaps on the shot list and schedule health on the stripboard.
+                    </p>
+
+                    <label className="flex items-center justify-between cursor-pointer">
+                      <span className="font-semibold">Show Production Readiness</span>
+                      <input
+                        type="checkbox"
+                        checked={displaySettings.showProductionReadiness === true}
+                        onChange={(e) => updateDisplaySettings({ showProductionReadiness: e.target.checked })}
+                        className="rounded accent-sky-500 w-4 h-4 cursor-pointer"
+                      />
+                    </label>
+                    <p className={`text-[10px] -mt-1 mb-1 text-ink-muted`}>
+                      Floating blocker and warning summary across production departments.
+                    </p>
+
+                    <label className="flex items-center justify-between cursor-pointer">
+                      <span className="font-semibold">Show Review Notes</span>
+                      <input
+                        type="checkbox"
+                        checked={displaySettings.showReviewNotes === true}
+                        onChange={(e) => updateDisplaySettings({ showReviewNotes: e.target.checked })}
+                        className="rounded accent-sky-500 w-4 h-4 cursor-pointer"
+                      />
+                    </label>
+                    <p className={`text-[10px] -mt-1 mb-1 text-ink-muted`}>
+                      Floating review-threads button over the floor plan.
+                    </p>
+
+                    <label className="flex items-center justify-between cursor-pointer">
+                      <span className="font-semibold">Show Panel Explanations</span>
+                      <input
+                        type="checkbox"
+                        checked={displaySettings.showPanelIntros === true}
+                        onChange={(e) => updateDisplaySettings({ showPanelIntros: e.target.checked })}
+                        className="rounded accent-sky-500 w-4 h-4 cursor-pointer"
+                      />
+                    </label>
+                    <p className={`text-[10px] -mt-1 mb-1 text-ink-muted`}>
+                      Per-tab intro strips explaining what each panel is for.
+                    </p>
+
+                    {/* Waypoint dialogue/action cues */}
+                    <label className="flex items-center justify-between cursor-pointer">
+                      <span className="font-semibold">Show Waypoint Cues / Dialogue</span>
+                      <input
+                        type="checkbox"
+                        checked={displaySettings.showWaypointCues === true}
+                        onChange={(e) => updateDisplaySettings({ showWaypointCues: e.target.checked })}
+                        className="rounded accent-sky-500 w-4 h-4 cursor-pointer"
+                      />
+                    </label>
+
+                    <label className="flex items-center justify-between cursor-pointer">
+                      <span className="font-semibold">Show Actor Speech Bubbles</span>
+                      <input
+                        type="checkbox"
+                        checked={displaySettings.showSpeechBubbles === true}
+                        onChange={(e) => updateDisplaySettings({ showSpeechBubbles: e.target.checked })}
+                        className="rounded accent-sky-500 w-4 h-4 cursor-pointer"
+                      />
+                    </label>
+
+                    {/* Lined script shot types (WS, CU...) */}
+                    <label className="flex items-center justify-between cursor-pointer">
+                      <span className="font-semibold">Show Shot Types (WS, CU...) in Script</span>
+                      <input
+                        type="checkbox"
+                        checked={displaySettings.showShotSizeInScript !== false}
+                        onChange={(e) => updateDisplaySettings({ showShotSizeInScript: e.target.checked })}
+                        className="rounded accent-sky-500 w-4 h-4 cursor-pointer"
+                      />
+                    </label>
+
+                    {/* Light Label Details Section */}
+                    <div className="border-t pt-2 space-y-1.5">
+                      <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                        Light Label Elements
+                      </div>
+                      <label className="flex items-center justify-between cursor-pointer">
+                        <span>Light Function / Role (Key, Fill...)</span>
+                        <input
+                          type="checkbox"
+                          checked={displaySettings.showLightRoleLabels !== false}
+                          onChange={(e) => updateDisplaySettings({ showLightRoleLabels: e.target.checked })}
+                          className="rounded accent-sky-500 w-3.5 h-3.5 cursor-pointer"
+                        />
+                      </label>
+                      <label className="flex items-center justify-between cursor-pointer">
+                        <span>Fixture Name / Model</span>
+                        <input
+                          type="checkbox"
+                          checked={displaySettings.showLightNameLabels !== false}
+                          onChange={(e) => updateDisplaySettings({ showLightNameLabels: e.target.checked })}
+                          className="rounded accent-sky-500 w-3.5 h-3.5 cursor-pointer"
+                        />
+                      </label>
+                      <label className="flex items-center justify-between cursor-pointer">
+                        <span>Color Temp (Kelvin)</span>
+                        <input
+                          type="checkbox"
+                          checked={displaySettings.showLightKelvinLabels === true}
+                          onChange={(e) => updateDisplaySettings({ showLightKelvinLabels: e.target.checked })}
+                          className="rounded accent-sky-500 w-3.5 h-3.5 cursor-pointer"
+                        />
+                      </label>
+                      <label className="flex items-center justify-between cursor-pointer">
+                        <span>Dim Level (%)</span>
+                        <input
+                          type="checkbox"
+                          checked={displaySettings.showLightIntensityLabels === true}
+                          onChange={(e) => updateDisplaySettings({ showLightIntensityLabels: e.target.checked })}
+                          className="rounded accent-sky-500 w-3.5 h-3.5 cursor-pointer"
+                        />
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className="border-t pt-2.5 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                          Workspace tabs
+                        </div>
+                        <p className="text-[10px] opacity-60 mt-0.5">Project presets are defaults—you can expose any module.</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => PICKABLE_MODULES.forEach((module) => setModuleVisible(module.id, true))}
+                        className="px-2 py-1 rounded-md bg-accent hover:bg-accent-hover text-white text-[10px] font-bold whitespace-nowrap"
+                      >
+                        Show all
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+                      {MODULE_PICKER_GROUPS.map((group) => (
+                        <section key={group.label}>
+                          <div className="text-[10px] font-black uppercase tracking-[0.14em] opacity-40 mb-1">
+                            {group.label}
+                          </div>
+                          {group.modules.map((module) => (
+                            <label key={module.id} className="flex items-center gap-2 cursor-pointer text-[11px] min-w-0 py-0.5">
+                              <input
+                                type="checkbox"
+                                checked={isModuleVisible(module.id)}
+                                onChange={(event) => setModuleVisible(module.id, event.target.checked)}
+                                className="rounded accent-sky-500 w-3.5 h-3.5 cursor-pointer flex-shrink-0"
+                              />
+                              <span className="truncate">{module.label}</span>
+                            </label>
+                          ))}
+                        </section>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Category Opacity Sliders */}
+                  <div className="border-t pt-2.5 space-y-2.5">
+                    <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                      Category Opacity Sliders
+                    </div>
+
+                    {OPACITY_CATEGORIES.map(({ key, label }) => {
+                      const currentVal = Math.round(
+                        (displaySettings.categoryOpacity?.[key] ?? 1.0) * 100
+                      );
+                      return (
+                        <div key={key} className="space-y-1">
+                          <div className="flex justify-between text-[11px] font-medium">
+                            <span>{label}</span>
+                            <span className="font-mono text-sky-400">{currentVal}%</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={100}
+                            value={currentVal}
+                            onChange={(e) => {
+                              const val = Number(e.target.value) / 100;
+                              updateDisplaySettings({
+                                categoryOpacity: {
+                                  ...displaySettings.categoryOpacity,
+                                  [key]: val,
+                                },
+                              });
+                            }}
+                            className="w-full accent-sky-500 h-1.5 bg-slate-700 rounded-lg cursor-pointer"
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Viewfinder Button */}
+            <button
+              onClick={() => openViewfinder()}
+              title={t('nav.viewfinder')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors ${
+                'border-transparent hover:bg-surface-hover text-ink-soft'
+              }`}
+            >
+              <Eye className="w-3.5 h-3.5 text-ink-muted" />
+              <span className="hidden lg:inline">{t('nav.viewfinder')}</span>
+            </button>
+          </>
+        )}
+
+        {/* Export / Call Sheet Print Button - always reachable */}
+        <button
+          id="btn-open-export"
+          onClick={() => openExportModal()}
+          title={t('nav.export')}
+          aria-label={t('nav.export')}
+          className="h-8 w-8 inline-flex items-center justify-center bg-accent hover:bg-accent-hover text-white rounded-md transition-colors shadow-sm"
+        >
+          <FileDown className="w-3.5 h-3.5" />
+        </button>
+
+        {!isCompact && (
+          <>
+            {/* Save Project File Button with format menu (.osd first). */}
+            <div className="relative">
+              <button
+                onClick={() => {
+                  setSaveFormat('osd');
+                  setIsSaveMenuOpen((open) => !open);
+                }}
+                aria-expanded={isSaveMenuOpen}
+                title={t('nav.saveProject')}
+                aria-label={t('nav.saveProject')}
+                className="p-2 rounded-lg border border-transparent transition-colors text-ink-muted hover:text-ink hover:bg-surface-hover"
+              >
+                <Save className="w-3.5 h-3.5" />
+              </button>
+
+              {isSaveMenuOpen && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setIsSaveMenuOpen(false)} />
+                  <div
+                    role="dialog"
+                    aria-label="Save project file format"
+                    className={`absolute right-0 top-full mt-1.5 w-60 border rounded-xl shadow-2xl p-2.5 z-50 space-y-1 text-left ${
+                      'bg-surface border-line text-slate-800 dark:text-slate-100'
+                    }`}
+                  >
+                    <label className={`flex items-start gap-2 p-2 rounded-lg cursor-pointer text-xs hover:bg-surface-hover`}>
+                      <input
+                        type="radio"
+                        name="topbar-save-format"
+                        checked={saveFormat === 'osd'}
+                        onChange={() => setSaveFormat('osd')}
+                        className="accent-sky-600 mt-0.5"
+                      />
+                      <span>
+                        <strong>.osd package</strong>
+                        <span className={`block text-[10px] text-ink-muted`}>
+                          Project + all images. The backup to take.
+                        </span>
+                      </span>
+                    </label>
+                    <label className={`flex items-start gap-2 p-2 rounded-lg cursor-pointer text-xs hover:bg-surface-hover`}>
+                      <input
+                        type="radio"
+                        name="topbar-save-format"
+                        checked={saveFormat === 'json'}
+                        onChange={() => setSaveFormat('json')}
+                        className="accent-sky-600 mt-0.5"
+                      />
+                      <span>
+                        <strong>JSON</strong>
+                        <span className={`block text-[10px] text-ink-muted`}>
+                          Project only, no media. For experts.
+                        </span>
+                      </span>
+                    </label>
+                    <div className="flex gap-1.5 pt-1">
+                      <button
+                        onClick={runSaveMenu}
+                        className="flex-1 px-2.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-semibold"
+                      >
+                        {lang === 'zh' ? '保存' : 'Save'}
+                      </button>
+                      <button
+                        onClick={() => setIsSaveMenuOpen(false)}
+                        className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-semibold border-line-strong hover:bg-surface-hover`}
+                      >
+                        {lang === 'zh' ? '取消' : 'Cancel'}
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              title={t('nav.openProject')}
+              aria-label={t('nav.openProject')}
+              className="p-2 rounded-lg border border-transparent transition-colors text-ink-muted hover:text-ink hover:bg-surface-hover"
+            >
+              <FolderOpen className="w-3.5 h-3.5" />
+            </button>
+          </>
+        )}
+
+        {/* Hidden Import File Input (shared by both layouts) */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".json"
+          onChange={handleImportJson}
+          className="hidden"
+        />
+
+        {/* Live shot tracker on desktop: the overflow menu that carries it on
+            phones only renders when compact, so without this the one button
+            that must be findable mid-shoot was unreachable on a laptop. */}
+        {!isCompact && (
+          <button
+            onClick={() => setIsOnSetMode(true)}
+            title={lang === 'zh' ? '现场镜头跟踪器' : 'Live shot tracker — on-set mode (plan §35)'}
+            aria-label={lang === 'zh' ? '打开现场镜头跟踪器' : 'Open live shot tracker'}
+            className={`p-2 rounded-lg border transition-colors ${
+              'border-transparent text-ink-muted hover:text-ink hover:bg-surface-hover'
+            }`}
+          >
+            <Clapperboard className="w-4 h-4" />
+          </button>
+        )}
+
+        {/* Support the project — far right, past the live shot tracker */}
+        {!isCompact && (
+          <>
+            <span className="h-5 w-px bg-line mx-0.5" aria-hidden="true" />
+            <a
+              href={SPONSOR_LINKS.github}
+              target="_blank"
+              rel="noreferrer noopener"
+              title={lang === 'zh' ? '在 GitHub 上支持本项目' : 'Sponsor on GitHub'}
+              aria-label={lang === 'zh' ? '在 GitHub 上支持本项目' : 'Sponsor on GitHub'}
+              className={`p-2 rounded-lg border transition-colors ${
+                'border-transparent text-ink-subtle hover:text-pink-500 hover:bg-surface-hover'
+              }`}
+            >
+              <Heart className="w-3.5 h-3.5" />
+            </a>
+            <a
+              href={SPONSOR_LINKS.coffee}
+              target="_blank"
+              rel="noreferrer noopener"
+              title={lang === 'zh' ? '请作者喝杯咖啡' : 'Buy me a coffee'}
+              aria-label={lang === 'zh' ? '请作者喝杯咖啡' : 'Buy me a coffee'}
+              className={`p-2 rounded-lg border transition-colors ${
+                'border-transparent text-ink-subtle hover:text-warn hover:bg-surface-hover'
+              }`}
+            >
+              <Coffee className="w-3.5 h-3.5" />
+            </a>
+          </>
+        )}
+
+        {/* Overflow menu for narrow screens */}
+        {isCompact && (
+          <div className="relative" ref={overflowMenuRef}>
+            <button
+              onClick={() => setIsOverflowOpen((open) => !open)}
+              title="More controls"
+              aria-expanded={isOverflowOpen}
+              aria-label="More controls"
+              className={`p-2 rounded-lg border transition-colors ${
+                'border-transparent text-ink-muted hover:text-ink hover:bg-surface-hover'
+              }`}
+            >
+              <MoreHorizontal className="w-4 h-4" />
+            </button>
+
+            {isOverflowOpen && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setIsOverflowOpen(false)} />
+                <div className={`absolute right-0 top-full mt-1.5 w-52 border rounded-xl shadow-2xl p-1.5 z-50 space-y-0.5 ${
+                  'bg-surface border-line text-ink'
+                }`}>
+                  <button
+                    onClick={() => {
+                      openDashboard();
+                      setIsOverflowOpen(false);
+                    }}
+                    className={overflowItemClass}
+                  >
+                    <span className="flex items-center gap-2"><LayoutGrid className="w-3.5 h-3.5" /> {lang === 'zh' ? '全部项目' : 'All projects'}</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      // Two sequential prompts, as before: the note stays
+                      // optional, so cancelling it still saves the revision.
+                      void (async () => {
+                        const name = await prompt({
+                          title: 'Name this revision',
+                          label: 'Revision name',
+                          defaultValue: `Revision ${(project.revisions?.length || 0) + 1}`,
+                          requireValue: true,
+                        });
+                        if (name === null) return;
+                        const note = await prompt({
+                          title: 'Add a note',
+                          message: 'Optional — leave empty or cancel to skip.',
+                          label: 'Note',
+                          confirmLabel: 'Save revision',
+                        });
+                        saveRevision(name, note ?? undefined);
+                        setIsOverflowOpen(false);
+                      })();
+                    }}
+                    className={overflowItemClass}
+                  >
+                    <span className="flex items-center gap-2"><History className="w-3.5 h-3.5" /> {lang === 'zh' ? '保存修订…' : 'Save revision…'}</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setGridSettings({ snap: !gridSettings.snap });
+                      setIsOverflowOpen(false);
+                    }}
+                    className={overflowItemClass}
+                  >
+                    <span className="flex items-center gap-2"><Magnet className="w-3.5 h-3.5" /> {lang === 'zh' ? '吸附网格' : 'Snap to grid'}</span>
+                    <span className="text-[10px] font-mono opacity-70">{gridSettings.snap ? 'ON' : 'OFF'}</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setGridSettings({
+                        unit: gridSettings.unit === 'm' ? 'ft' : 'm',
+                        pixelsPerUnit: gridSettings.unit === 'm' ? 25 : 30,
+                      });
+                      setIsOverflowOpen(false);
+                    }}
+                    className={overflowItemClass}
+                  >
+                    <span>{lang === 'zh' ? '网格单位' : 'Grid units'}</span>
+                    <span className="text-[10px] font-mono opacity-70">{gridSettings.unit.toUpperCase()}</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      toggleTheme();
+                      setIsOverflowOpen(false);
+                    }}
+                    className={overflowItemClass}
+                  >
+                    <span className="flex items-center gap-2">
+                      {isLight ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />} {lang === 'zh' ? '主题' : 'Theme'}
+                    </span>
+                    <span className="text-[10px] opacity-70">{isLight ? 'Light' : 'Dark'}</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setIsOnSetMode(true);
+                      setIsOverflowOpen(false);
+                    }}
+                    className={overflowItemClass}
+                  >
+                    <span className="flex items-center gap-2"><Clapperboard className="w-3.5 h-3.5 text-ok" /> {lang === 'zh' ? '现场镜头跟踪' : 'Live shot tracker'}</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      openViewfinder();
+                      setIsOverflowOpen(false);
+                    }}
+                    className={overflowItemClass}
+                  >
+                    <span className="flex items-center gap-2"><Eye className="w-3.5 h-3.5 text-ink-muted" /> {lang === 'zh' ? '取景器' : 'Viewfinder'}</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      handleExportOsd();
+                      setIsOverflowOpen(false);
+                    }}
+                    className={overflowItemClass}
+                  >
+                    <span className="flex items-center gap-2"><Save className="w-3.5 h-3.5" /> {lang === 'zh' ? '保存 .osd 包' : 'Save .osd package'}</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      handleExportJson();
+                      setIsOverflowOpen(false);
+                    }}
+                    className={overflowItemClass}
+                  >
+                    <span className="flex items-center gap-2"><Download className="w-3.5 h-3.5" /> {lang === 'zh' ? '保存 JSON（专家）' : 'Save JSON (experts)'}</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      fileInputRef.current?.click();
+                      setIsOverflowOpen(false);
+                    }}
+                    className={overflowItemClass}
+                  >
+                    <span className="flex items-center gap-2"><FolderOpen className="w-3.5 h-3.5" /> {lang === 'zh' ? '打开项目文件' : 'Open project file'}</span>
+                  </button>
+                  <a
+                    href={SPONSOR_LINKS.github}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    onClick={() => setIsOverflowOpen(false)}
+                    className={overflowItemClass}
+                  >
+                    <span className="flex items-center gap-2"><Heart className="w-3.5 h-3.5 text-pink-500" /> {lang === 'zh' ? '在 GitHub 上支持项目' : 'Sponsor on GitHub'}</span>
+                  </a>
+                  <a
+                    href={SPONSOR_LINKS.coffee}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    onClick={() => setIsOverflowOpen(false)}
+                    className={overflowItemClass}
+                  >
+                    <span className="flex items-center gap-2"><Coffee className="w-3.5 h-3.5 text-warn" /> {lang === 'zh' ? '请作者喝杯咖啡' : 'Buy me a coffee'}</span>
+                  </a>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      {isOnSetMode && <Suspense fallback={null}><OnSetModeOverlay onClose={() => setIsOnSetMode(false)} /></Suspense>}
+    </header>
+  );
+};

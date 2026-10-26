@@ -1,0 +1,816 @@
+import React, { useLayoutEffect, useRef, useState } from 'react';
+import { toggleShortcutSheet } from '../common/ShortcutSheet';
+import { useFloorPlan } from '../../context/FloorPlanContext';
+import { useDialogs } from '../dialog/DialogProvider';
+import { ActiveTool, CableType, ShapeType } from '../../types';
+import { CABLE_TYPES, CAMERA_RIGS, LIGHT_FIXTURES, PROP_CATALOG } from '../../constants/presets';
+import { loadBackgroundImageFile } from '../../utils/image';
+import { useBreakpoint } from '../../utils/useMediaQuery';
+import { CStandIcon, DollyIcon, FresnelLightIcon, MovieCameraIcon } from '../icons/ProductionIcons';
+import {
+  Cable,
+  DoorClosed,
+  Flag,
+  Hand,
+  ImagePlus,
+  MousePointer,
+  Route,
+  MoveUpRight,
+  Pencil,
+  Ruler,
+  Search,
+  BrickWall,
+  Armchair,
+  Type,
+  PersonStanding,
+  MoreHorizontal,
+  Mic2,
+  Building2,
+  Shapes,
+  Circle,
+  Keyboard,
+} from 'lucide-react';
+import { useWorkspaceUI } from '../../context/WorkspaceUIContext';
+import { useLanguage } from '../../i18n/LanguageContext';
+import { cameraRigLabel, lightFixtureLabel, propCategoryLabel, propLabel } from '../../i18n/domainLabels';
+
+/** Toolbar sections, separated by a thin rule: how the tools are used, not what they draw. */
+type ToolGroup = 'navigate' | 'people' | 'set' | 'markup';
+
+interface ToolItem {
+  id: ActiveTool;
+  group: ToolGroup;
+  label: string;
+  shortcut: string;
+  icon: React.ReactNode;
+  hasSubmenu?: boolean;
+  /**
+   * Which panel this button opens, when that is not simply `id`.
+   *
+   * Props, staging, grip and architecture are four buttons that all place a
+   * `prop` — they differ only in which slice of the catalogue they show. Giving
+   * them one tool and four submenus keeps placement a single code path: adding
+   * an `ActiveTool` per category would mean the canvas learning four names for
+   * one behaviour.
+   */
+  submenuKey?: Submenu;
+  /** Catalogue categories this button's submenu lists. */
+  propCategories?: readonly string[];
+}
+
+type Submenu =
+  | 'prop'
+  | 'staging'
+  | 'grip'
+  | 'architecture'
+  | 'light'
+  | 'camera'
+  | 'shape'
+  | 'cable'
+  | 'overflow';
+
+/**
+ * The catalogue's categories, split the way people reach for them.
+ *
+ * Staging was the change that mattered: it is a third of the catalogue and it
+ * used to sit inside "Props", where nobody would look for a speaker array.
+ * Grip stays separate from it because a C-stand and a PA stack belong to
+ * different departments at different moments.
+ */
+const SET_DRESSING_CATEGORIES = [
+  'Living',
+  'Dining & Office',
+  'Bedroom',
+  'Weapons & Explosives',
+  'Documents & Hand Props',
+  'Vehicles',
+  'Landscape',
+  'Generic',
+] as const;
+const STAGING_CATEGORIES = ['Concert & Stage', 'Broadcast & Production'] as const;
+const GRIP_CATEGORIES = ['Studio & Stage'] as const;
+const ARCHITECTURE_CATEGORIES = ['Architecture'] as const;
+
+const SHAPE_OPTIONS: { value: ShapeType; label: string }[] = [
+  { value: 'rectangle', label: 'Rectangle' },
+  { value: 'line', label: 'Line Segment' },
+  { value: 'circle', label: 'Circle' },
+  { value: 'ellipse', label: 'Ellipse' },
+  { value: 'triangle', label: 'Triangle' },
+  { value: 'diamond', label: 'Diamond' },
+  { value: 'pentagon', label: 'Pentagon' },
+  { value: 'hexagon', label: 'Hexagon' },
+  { value: 'star', label: 'Star' },
+];
+
+/** Tools that stay on the bar when there is no room for the full palette. */
+const PRIMARY_TOOL_IDS: ActiveTool[] = ['select', 'pan', 'actor', 'camera', 'light', 'wall'];
+
+const ArchitecturalWindowIcon: React.FC<{ className?: string }> = ({ className = 'w-4 h-4 text-accent-ink' }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+  >
+    <rect x="3" y="3" width="18" height="18" rx="2" />
+    <line x1="12" y1="3" x2="12" y2="21" />
+    <line x1="3" y1="12" x2="21" y2="12" />
+    <line x1="2" y1="21" x2="22" y2="21" strokeWidth="2.5" />
+  </svg>
+);
+
+export const LeftToolbar: React.FC = () => {
+  const { activeTool, setTool, activePropSubtype, setPropSubtype, activeLightFixture, setLightFixture, activeCameraRig, setCameraRig, activeShapeType, setShapeType, activeCableType, setCableType, addBackgroundImage } = useFloorPlan();
+  const { notice } = useDialogs();
+  const { setQuickSearchOpen, theme } = useWorkspaceUI();
+  const { lang } = useLanguage();
+  const isZh = lang === 'zh';
+  const [openSubmenu, setOpenSubmenu] = useState<Submenu | null>(null);
+  const floorplanInputRef = useRef<HTMLInputElement>(null);
+  const asideRef = useRef<HTMLElement>(null);
+  const { isCompact, isTiny } = useBreakpoint();
+  // How many tool buttons fit in the palette's height. The bar never scrolls:
+  // whatever doesn't fit moves into the overflow flyout.
+  const [fitCount, setFitCount] = useState(Infinity);
+
+  // Buttons shrink on tablets; on phones the palette keeps only the primary
+  // tools and moves the rest into an overflow flyout.
+  const buttonSize = isTiny ? 'w-9 h-9' : isCompact ? 'w-9 h-9' : 'w-10 h-10';
+  const iconScale = isCompact ? 'scale-95' : '';
+
+  const handleFloorplanUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    loadBackgroundImageFile(file)
+      .then((bg) => addBackgroundImage(bg))
+      .catch(() => { void notice({ title: isZh ? '无法读取图片' : 'Image unreadable', message: isZh ? '无法加载所选图片文件。' : 'Could not load the selected image file.' }); });
+    if (floorplanInputRef.current) floorplanInputRef.current.value = '';
+  };
+
+  const isLight = theme === 'light';
+
+  useLayoutEffect(() => {
+    const aside = asideRef.current;
+    if (!aside) return;
+
+    const measure = () => {
+      const buttonPx = isCompact ? 36 : 40;
+      const gapPx = isCompact ? 4 : 6;
+      // Quick search + divider + overflow button + upload button keep their slots.
+      const reserved = (buttonPx + gapPx) * 3 + 24;
+      const available = aside.clientHeight - reserved;
+      setFitCount(Math.max(3, Math.floor(available / (buttonPx + gapPx))));
+    };
+
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(aside);
+    return () => observer.disconnect();
+  }, [isCompact]);
+
+  const toggleSubmenu = (tool: ToolItem) => {
+    setTool(tool.id);
+    const key = tool.submenuKey ?? (tool.id as Submenu);
+    if (tool.hasSubmenu) {
+      setOpenSubmenu((prev) => (prev === key ? null : key));
+    } else {
+      setOpenSubmenu(null);
+    }
+  };
+
+  const tools: ToolItem[] = [
+    {
+      id: 'select',
+      group: 'navigate',
+      label: isZh ? '选择 / 移动' : 'Select / Move',
+      shortcut: 'V',
+      icon: <MousePointer className="w-4 h-4" />,
+    },
+    {
+      id: 'pan',
+      group: 'navigate',
+      label: isZh ? '平移画布' : 'Pan Canvas',
+      shortcut: 'H',
+      icon: <Hand className="w-4 h-4" />,
+    },
+    {
+      id: 'actor',
+      group: 'people',
+      label: isZh ? '人物 / 演员' : 'Actor / Talent',
+      shortcut: 'A',
+      icon: <PersonStanding className="w-4 h-4" />,
+    },
+    {
+      id: 'camera',
+      group: 'people',
+      label: isZh ? '摄影机 / 镜头' : 'Camera & Shot',
+      shortcut: 'C',
+      icon: <MovieCameraIcon className="w-4 h-4" />,
+      hasSubmenu: true,
+    },
+    {
+      id: 'light',
+      group: 'people',
+      label: isZh ? '灯具' : 'Light Fixture',
+      shortcut: 'L',
+      icon: <FresnelLightIcon className="w-4 h-4" />,
+      hasSubmenu: true,
+    },
+    {
+      id: 'wall',
+      group: 'set',
+      label: isZh ? '墙体 / 房间' : 'Wall / Room',
+      shortcut: 'W',
+      icon: <BrickWall className="w-4 h-4" />,
+    },
+    {
+      id: 'door',
+      group: 'set',
+      label: isZh ? '门（吸附墙体）' : 'Door (Wall Snap)',
+      shortcut: 'D',
+      icon: <DoorClosed className="w-4 h-4" />,
+    },
+    {
+      id: 'window',
+      group: 'set',
+      label: isZh ? '窗（吸附墙体）' : 'Window (Wall Snap)',
+      shortcut: 'N',
+      icon: <ArchitecturalWindowIcon className="w-4 h-4" />,
+    },
+    {
+      id: 'prop',
+      group: 'set',
+      label: isZh ? '道具' : 'Props',
+      shortcut: 'P',
+      icon: <Armchair className="w-4 h-4" />,
+      hasSubmenu: true,
+      submenuKey: 'prop',
+      propCategories: SET_DRESSING_CATEGORIES,
+    },
+    {
+      id: 'prop',
+      group: 'set',
+      label: isZh ? '舞台 / 现场' : 'Staging & Live',
+      shortcut: 'E',
+      icon: <Mic2 className="w-4 h-4" />,
+      hasSubmenu: true,
+      submenuKey: 'staging',
+      propCategories: STAGING_CATEGORIES,
+    },
+    {
+      id: 'prop',
+      group: 'set',
+      label: isZh ? '摄影棚 / 场务器材' : 'Studio & Grip',
+      shortcut: 'U',
+      icon: <CStandIcon className="w-4 h-4" />,
+      hasSubmenu: true,
+      submenuKey: 'grip',
+      propCategories: GRIP_CATEGORIES,
+    },
+    {
+      id: 'prop',
+      group: 'set',
+      label: isZh ? '建筑 / 固定装置' : 'Architecture & Fixtures',
+      shortcut: 'F',
+      icon: <Building2 className="w-4 h-4" />,
+      hasSubmenu: true,
+      submenuKey: 'architecture',
+      propCategories: ARCHITECTURE_CATEGORIES,
+    },
+    {
+      id: 'shape',
+      group: 'set',
+      label: isZh ? '形状（区域）' : 'Shape (zone / area)',
+      shortcut: 'S',
+      icon: <Shapes className="w-4 h-4" />,
+      hasSubmenu: true,
+    },
+    {
+      id: 'track',
+      group: 'set',
+      label: isZh ? '摄影车轨道' : 'Dolly Track',
+      shortcut: 'T',
+      icon: <DollyIcon className="w-4 h-4" />,
+    },
+    {
+      id: 'road',
+      group: 'set',
+      label: isZh ? '街道 / 道路' : 'Street / Road',
+      shortcut: 'R',
+      icon: <Route className="w-4 h-4" />,
+    },
+    {
+      id: 'measure',
+      group: 'markup',
+      label: isZh ? '卷尺测量' : 'Tape Measure',
+      shortcut: 'M',
+      icon: <Ruler className="w-4 h-4" />,
+    },
+    {
+      id: 'arrow',
+      group: 'markup',
+      label: isZh ? '箭头 / 方向' : 'Arrow / Direction',
+      shortcut: 'G',
+      icon: <MoveUpRight className="w-4 h-4" />,
+    },
+    {
+      id: 'cable',
+      group: 'markup',
+      label: isZh ? '线缆 / 接线路径' : 'Cable / Patch Run',
+      shortcut: 'K',
+      icon: <Cable className="w-4 h-4" />,
+      hasSubmenu: true,
+    },
+    {
+      id: 'text',
+      group: 'markup',
+      label: isZh ? '文字标注' : 'Text Annotation',
+      shortcut: 'X',
+      icon: <Type className="w-4 h-4" />,
+    },
+    {
+      id: 'stroke',
+      group: 'markup',
+      label: isZh ? '画笔 / 批注' : 'Pen / Annotate',
+      shortcut: 'B',
+      icon: <Pencil className="w-4 h-4" />,
+    },
+  ];
+
+  // On a phone the palette keeps the primary tools, and on any short screen it
+  // keeps as many as fit; the rest move into the overflow flyout.
+  const capacity = Math.max(3, Math.min(fitCount, isTiny ? PRIMARY_TOOL_IDS.length : tools.length));
+  const ordered = isTiny
+    ? [...tools].sort((a, b) => {
+        const rank = (id: ActiveTool) => (PRIMARY_TOOL_IDS.includes(id) ? 0 : 1);
+        return rank(a.id) - rank(b.id);
+      })
+    : tools;
+  let visibleTools = ordered.slice(0, capacity);
+  const overflowTools = ordered.slice(capacity);
+  // The active tool is always on the bar, even if it normally lives in overflow.
+  if (overflowTools.some((tool) => tool.id === activeTool)) {
+    const active = overflowTools.find((tool) => tool.id === activeTool)!;
+    const displaced = visibleTools[visibleTools.length - 1];
+    visibleTools = [...visibleTools.slice(0, -1), active];
+    overflowTools.splice(overflowTools.indexOf(active), 1, displaced);
+  }
+
+  const [propSearch, setPropSearch] = useState('');
+  const [lightSearch, setLightSearch] = useState('');
+
+  const leftOffset = isCompact ? 'left-12' : 'left-14';
+  const flyoutBase = `fixed ${leftOffset} top-14 ml-2 border rounded-xl shadow-2xl p-2.5 z-50 animate-in fade-in slide-in-from-left-1 max-h-[calc(100vh-80px)] overflow-y-auto custom-scrollbar overscroll-contain ${
+    'bg-surface border-line text-ink'
+  }`;
+
+  const listButtonClass = (active: boolean) =>
+    `w-full text-left px-2.5 py-1.5 rounded-lg text-xs flex items-center justify-between transition-colors ${
+      active
+        ? 'bg-accent text-white font-semibold'
+        : isLight
+        ? 'text-slate-700 hover:bg-slate-100'
+        : 'text-slate-300 hover:bg-slate-800'
+    }`;
+
+  const normalizeQuery = (text: string) => text.toLowerCase().replace(/[-_/\\+()#.,"'`]/g, ' ').trim();
+
+  const filteredProps = PROP_CATALOG.filter((p) => {
+    if (!propSearch) return true;
+    const qTokens = normalizeQuery(propSearch).split(' ').filter(Boolean);
+    const textToMatch = normalizeQuery(`${p.name} ${propLabel(p.type, p.name, 'zh')} ${p.category} ${propCategoryLabel(p.category, 'zh')} ${p.type}`);
+    return qTokens.every((tok) => textToMatch.includes(tok));
+  });
+
+  /** The search-filtered catalogue, narrowed to one toolbar button's slice. */
+  const propsForTool = (tool: ToolItem) =>
+    tool.propCategories
+      ? filteredProps.filter((prop) => tool.propCategories!.includes(prop.category))
+      : filteredProps;
+
+  const filteredLights = LIGHT_FIXTURES.filter((f) => {
+    if (!lightSearch) return true;
+    const qTokens = normalizeQuery(lightSearch).split(' ').filter(Boolean);
+    const textToMatch = normalizeQuery(`${f.name} ${lightFixtureLabel(f.type, f.name, 'zh')} ${f.type} ${f.isFlag ? 'flag cstand grip 旗板 场务' : 'light lamp 灯具'}`);
+    return qTokens.every((tok) => textToMatch.includes(tok));
+  });
+
+  return (
+    <aside
+      id="left-toolbar"
+      aria-label={isZh ? '绘图工具' : 'Drawing tools'}
+      ref={asideRef}
+      className={`relative ${isCompact ? 'w-12 py-1.5 gap-1' : 'w-14 py-3 gap-1.5'} border-r flex flex-col items-center select-none z-20 transition-colors ${
+        'bg-surface border-line'
+      }`}
+    >
+      {/* Quick Asset Search (Shift+Space) */}
+      <div className="relative group mb-1">
+        <button
+          id="tool-btn-quick-search"
+          onClick={() => setQuickSearchOpen(true)}
+          title={isZh ? '快速搜索：镜头、场次、人物、日期、资产和命令（Shift+Space）' : 'Quick search: shots, scenes, people, days, assets and commands (Shift+Space)'}
+          aria-label={isZh ? '快速搜索（Shift+Space）' : 'Quick search (Shift+Space)'}
+          className={`${buttonSize} rounded-xl flex items-center justify-center transition-all ring-1 ring-inset ${
+            isLight
+              ? 'text-slate-500 hover:text-sky-600 hover:bg-sky-50 ring-slate-200'
+              : 'text-slate-400 hover:text-sky-300 hover:bg-slate-800 ring-slate-700/70'
+          }`}
+        >
+          <Search className="w-4 h-4" />
+        </button>
+        <div className="absolute left-full top-1/2 -translate-y-1/2 ml-2 px-2.5 py-1 bg-slate-950 border border-slate-700 text-slate-200 text-xs rounded-lg shadow-xl whitespace-nowrap opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 flex items-center gap-1.5">
+          <span className="font-medium">{isZh ? '快速搜索：镜头、场次、人物、命令' : 'Quick search — shots, scenes, people, commands'}</span>
+          <kbd className="px-1.5 py-0.2 text-[10px] font-mono bg-slate-800 text-slate-400 rounded border border-slate-700">
+            Shift Space
+          </kbd>
+        </div>
+      </div>
+
+      <div className={`w-8 border-t my-0.5 border-line`} />
+
+      {visibleTools.map((tool, index) => {
+        const isActive = activeTool === tool.id;
+        const startsGroup = index > 0 && visibleTools[index - 1].group !== tool.group;
+
+        return (
+          <React.Fragment key={tool.submenuKey ?? tool.id}>
+          {startsGroup && <div aria-hidden className="w-6 border-t border-line my-0.5" />}
+          <div className="relative group">
+            <button
+              id={`tool-btn-${tool.submenuKey ?? tool.id}`}
+              onClick={() => toggleSubmenu(tool)}
+              title={`${tool.label} (${tool.shortcut})`}
+              aria-label={`${tool.label} (${tool.shortcut})`}
+              aria-pressed={isActive}
+              className={`${buttonSize} ${iconScale} rounded-xl flex items-center justify-center transition-all ${
+                isActive
+                  ? 'bg-accent text-white shadow-md shadow-sky-600/30 scale-105'
+                  : isLight
+                  ? 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                  : 'text-slate-400 hover:text-slate-100 hover:bg-slate-800'
+              }`}
+            >
+              {tool.icon}
+              {/* A tool with a picker shows a corner tick, like most design apps. */}
+              {tool.hasSubmenu && (
+                <span aria-hidden className={`absolute bottom-1 right-1 w-0 h-0 border-l-[4px] border-l-transparent border-b-[4px] ${isActive ? 'border-b-white/80' : 'border-b-current opacity-50'}`} />
+              )}
+            </button>
+
+            {/* Hover Tooltip */}
+            <div className="absolute left-full top-1/2 -translate-y-1/2 ml-2 px-2.5 py-1 bg-slate-950 border border-slate-700 text-slate-200 text-xs rounded-lg shadow-xl whitespace-nowrap opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 flex items-center gap-1.5">
+              <span className="font-medium">{tool.label}</span>
+              <kbd className="px-1.5 py-0.2 text-[10px] font-mono bg-slate-800 text-slate-400 rounded border border-slate-700">
+                {tool.shortcut}
+              </kbd>
+            </div>
+
+            {/* ---- PROPS FLYOUT ---- */}
+            {tool.id === 'prop' && openSubmenu === (tool.submenuKey ?? 'prop') && (
+              <div className={`${flyoutBase} w-68 pb-6`}>
+                <div className="text-[10px] font-bold opacity-60 uppercase px-2 py-1 mb-1 tracking-wider border-b border-slate-700/50 pb-1.5 flex items-center justify-between">
+                  <span>{tool.label}</span>
+                  <span className="font-mono text-[10px] text-sky-400">
+                    {propsForTool(tool).length} {isZh ? '项' : 'items'}
+                  </span>
+                </div>
+
+                {/* Filter input */}
+                <div className="px-1 py-1 mb-1">
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                    <input
+                      type="text"
+                      value={propSearch}
+                      onChange={(e) => setPropSearch(e.target.value)}
+                      placeholder={isZh ? '筛选道具（如：汽车、桌子）…' : 'Filter props (e.g. car, gun)...'}
+                      className={`w-full pl-8 pr-2.5 py-1 text-xs rounded-lg border placeholder:text-slate-500 focus:outline-none focus:border-sky-500 ${
+                        'bg-surface-muted border-line-strong text-ink'
+                      }`}
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-3 py-1">
+                  {Object.entries(
+                    propsForTool(tool).reduce<Record<string, typeof filteredProps>>((acc, prop) => {
+                      (acc[prop.category] = acc[prop.category] || []).push(prop);
+                      return acc;
+                    }, {})
+                  ).map(([category, items]) => (
+                    <div key={category} className="space-y-1">
+                      <div className="text-[10px] font-semibold text-slate-400 px-2 py-0.5 flex items-center gap-1.5 uppercase tracking-wider">
+                        <span className="w-1.5 h-1.5 rounded-full bg-sky-500/70" />
+                        <span>{propCategoryLabel(category, lang)}</span>
+                      </div>
+                      <div className="space-y-0.5">
+                        {items.map((prop) => (
+                          <button
+                            key={prop.type}
+                            onClick={() => {
+                              setPropSubtype(prop.type);
+                              setTool('prop');
+                              setOpenSubmenu(null);
+                              setPropSearch('');
+                            }}
+                            className={listButtonClass(
+                              activePropSubtype === prop.type && activeTool === 'prop'
+                            )}
+                          >
+                            <span className="truncate">{propLabel(prop.type, prop.name, lang)}</span>
+                            {prop.category === 'Weapons & Explosives' ? (
+                              <span className="text-[10px] px-1.5 py-0.2 rounded bg-rose-950/60 text-rose-400 border border-rose-800/40 font-mono">
+                                {isZh ? (prop.type === 'bomb' ? '爆炸物' : '武器') : (prop.type === 'bomb' ? 'Explosive' : 'Weapon')}
+                              </span>
+                            ) : prop.category === 'Documents & Hand Props' ? (
+                              <span className="text-[10px] px-1.5 py-0.2 rounded bg-amber-950/60 text-amber-400 border border-amber-800/40 font-mono">
+                                {isZh ? '文件' : 'Document'}
+                              </span>
+                            ) : (
+                              <span className="text-[10px] opacity-50 font-mono">{propCategoryLabel(prop.category, lang).split(' ')[0]}</span>
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                  {filteredProps.length === 0 && (
+                    <div className="text-center py-4 text-xs text-slate-500">
+                      {isZh ? `没有匹配“${propSearch}”的道具` : `No props match "${propSearch}"`}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* ---- LIGHT FIXTURE FLYOUT ---- */}
+            {tool.id === 'light' && openSubmenu === 'light' && (
+              <div className={`${flyoutBase} w-72 pb-6`}>
+                <div className="text-[10px] font-bold opacity-60 uppercase px-2 py-1 mb-1 tracking-wider border-b border-slate-700/50 pb-1.5 flex items-center justify-between">
+                  <span>{isZh ? '灯光与场务器材' : 'Lighting & Grip Fixtures'}</span>
+                  <span className="font-mono text-[10px] text-amber-400">{filteredLights.length} {isZh ? '项' : 'items'}</span>
+                </div>
+
+                {/* Filter input */}
+                <div className="px-1 py-1 mb-1">
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                    <input
+                      type="text"
+                      value={lightSearch}
+                      onChange={(e) => setLightSearch(e.target.value)}
+                      placeholder={isZh ? '筛选灯具（如：柔光箱、灯管）…' : 'Filter lights (e.g. softbox, tube)...'}
+                      className={`w-full pl-8 pr-2.5 py-1 text-xs rounded-lg border placeholder:text-slate-500 focus:outline-none focus:border-amber-500 ${
+                        'bg-surface-muted border-line-strong text-ink'
+                      }`}
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-1 py-1">
+                  {filteredLights.map((f) => (
+                    <button
+                      key={f.type}
+                      onClick={() => {
+                        setLightFixture(f.type);
+                        setTool('light');
+                        setOpenSubmenu(null);
+                        setLightSearch('');
+                      }}
+                      className={listButtonClass(
+                        activeLightFixture === f.type && activeTool === 'light'
+                      )}
+                    >
+                      <span className="flex items-center gap-2 truncate">
+                        {f.isFlag ? (
+                          <Flag className="w-3.5 h-3.5 text-slate-400 flex-shrink-0" />
+                        ) : (
+                          <FresnelLightIcon className="w-3.5 h-3.5 text-warn flex-shrink-0" />
+                        )}
+                        <span className="truncate">{lightFixtureLabel(f.type, f.name, lang)}</span>
+                      </span>
+                      <span className="text-[10px] font-mono flex-shrink-0 ml-1.5">
+                        {f.type === 'softbox' ? (
+                          <span className="px-1.5 py-0.2 rounded bg-amber-950/60 text-amber-300 border border-amber-800/40">
+                            {isZh ? '柔光箱' : 'Softbox'}
+                          </span>
+                        ) : f.type === 'tube_light' ? (
+                          <span className="px-1.5 py-0.2 rounded bg-sky-950/60 text-sky-300 border border-sky-800/40">
+                            {isZh ? '灯管' : 'Tube'}
+                          </span>
+                        ) : f.isFlag ? (
+                          <span className="px-1.5 py-0.2 rounded bg-slate-800 text-slate-400 border border-slate-700">
+                            {isZh ? '旗板' : 'Flag'}
+                          </span>
+                        ) : (
+                          <span className="opacity-50">{isZh ? '灯具' : 'Light'}</span>
+                        )}
+                      </span>
+                    </button>
+                  ))}
+                  {filteredLights.length === 0 && (
+                    <div className="text-center py-4 text-xs text-slate-500">
+                      {isZh ? `没有匹配“${lightSearch}”的器材` : `No fixtures match "${lightSearch}"`}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* ---- SHAPE FLYOUT ---- */}
+            {tool.id === 'shape' && openSubmenu === 'shape' && (
+              <div className={`${flyoutBase} w-52`}>
+                <div className="text-[10px] font-bold opacity-60 uppercase px-2 py-1 mb-1">{isZh ? '形状' : 'Shapes'}</div>
+                <div className="space-y-1">
+                  {SHAPE_OPTIONS.map((option) => (
+                    <button
+                      key={option.value}
+                      onClick={() => {
+                        setShapeType(option.value);
+                        setTool('shape');
+                        setOpenSubmenu(null);
+                      }}
+                      className={listButtonClass(activeShapeType === option.value && activeTool === 'shape')}
+                    >
+                      <span>{isZh ? ({ rectangle: '矩形', line: '线段', circle: '圆形', ellipse: '椭圆', triangle: '三角形', diamond: '菱形', pentagon: '五边形', hexagon: '六边形', star: '星形' } as Record<string, string>)[option.value] : option.label}</span>
+                      <Circle className="w-3 h-3 opacity-40 flex-shrink-0" />
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* ---- CAMERA RIG FLYOUT ---- */}
+            {tool.id === 'camera' && openSubmenu === 'camera' && (
+              <div className={`${flyoutBase} w-64`}>
+                <div className="text-[10px] font-bold opacity-60 uppercase px-2 py-1 mb-1">
+                  {isZh ? '摄影机承托 / 安装方式' : 'Camera Rig / Mount'}
+                </div>
+                <div className="space-y-1">
+                  {CAMERA_RIGS.map((rig) => (
+                    <button
+                      key={rig.value}
+                      onClick={() => {
+                        setCameraRig(rig.value);
+                        setTool('camera');
+                        setOpenSubmenu(null);
+                      }}
+                      className={listButtonClass(
+                        activeCameraRig === rig.value && activeTool === 'camera'
+                      )}
+                    >
+                      <span>{cameraRigLabel(rig.value, rig.label, lang)}</span>
+                      <MovieCameraIcon className="w-3 h-3 opacity-40 flex-shrink-0" />
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* ---- CABLE TYPE FLYOUT ---- */}
+            {tool.id === 'cable' && openSubmenu === 'cable' && (
+              <div className={`${flyoutBase} w-72`}>
+                <div className="text-[10px] font-bold opacity-60 uppercase px-2 py-1 mb-1 flex items-center justify-between">
+                  <span>{isZh ? '信号 / 电源线缆' : 'Signal / Power Cables'}</span>
+                  <span className="font-mono text-[10px] text-cyan-400">
+                    {activeCableType}
+                  </span>
+                </div>
+                <div className="space-y-1">
+                  {CABLE_TYPES.map((ct) => (
+                    <button
+                      key={ct.type}
+                      onClick={() => {
+                        setCableType(ct.type as CableType);
+                        setTool('cable');
+                        setOpenSubmenu(null);
+                      }}
+                      className={listButtonClass(
+                        activeCableType === ct.type && activeTool === 'cable'
+                      )}
+                    >
+                      <span className="flex items-center gap-2 truncate">
+                        <span
+                          className="w-3 h-3 rounded-sm flex-shrink-0 border border-slate-700/50"
+                          style={{ backgroundColor: ct.color }}
+                        />
+                        <span className="truncate">{ct.name}</span>
+                      </span>
+                      <span
+                        className={`text-[10px] px-1.5 py-0.2 rounded font-mono flex-shrink-0 ml-1.5 ${
+                          ct.isPower
+                            ? 'bg-rose-950/60 text-rose-300 border border-rose-800/40'
+                            : 'bg-slate-800 text-slate-400 border border-slate-700'
+                        }`}
+                      >
+                        {ct.shortLabel}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+          </React.Fragment>
+        );
+      })}
+
+      {/* Overflow: the tools that don't fit on a phone-sized palette */}
+      {overflowTools.length > 0 && (
+        <div className="relative group">
+          <button
+            id="tool-btn-more"
+            onClick={() => setOpenSubmenu((prev) => (prev === 'overflow' ? null : 'overflow'))}
+            aria-expanded={openSubmenu === 'overflow'}
+            title={isZh ? '更多工具' : 'More tools'}
+            aria-label={isZh ? '更多工具' : 'More tools'}
+            className={`${buttonSize} rounded-xl flex items-center justify-center transition-all ${
+              overflowTools.some((tool) => tool.id === activeTool)
+                ? 'bg-accent text-white shadow-md shadow-sky-600/30'
+                : isLight
+                ? 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                : 'text-slate-400 hover:text-slate-100 hover:bg-slate-800'
+            }`}
+          >
+            <MoreHorizontal className="w-4 h-4" />
+          </button>
+
+          {openSubmenu === 'overflow' && (
+            <div className={`${flyoutBase} w-52`}>
+              <div className="text-[10px] font-bold opacity-60 uppercase px-2 py-1 mb-1">{isZh ? '更多工具' : 'More tools'}</div>
+              <div className="space-y-1">
+                {overflowTools.map((tool) => (
+                  <button
+                    key={tool.id}
+                    onClick={() => {
+                      setTool(tool.id);
+                      // Tools with their own palette open it straight away.
+                      setOpenSubmenu(tool.hasSubmenu ? (tool.id as Submenu) : null);
+                    }}
+                    className={listButtonClass(activeTool === tool.id)}
+                  >
+                    <span className="flex items-center gap-2">
+                      {tool.icon}
+                      <span>{tool.label}</span>
+                    </span>
+                    <span className="text-[10px] opacity-60 font-mono">{tool.shortcut}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Upload Floorplan / Reference Screenshot */}
+      <div className="relative group">
+        <input
+          ref={floorplanInputRef}
+          type="file"
+          aria-label="Choose floor plan image"
+          accept="image/*"
+          onChange={handleFloorplanUpload}
+          className="hidden"
+        />
+        <button
+          id="tool-btn-upload-floorplan"
+          onClick={() => floorplanInputRef.current?.click()}
+          title={isZh ? '上传平面图 / 截图' : 'Upload Floorplan / Screenshot'}
+          aria-label={isZh ? '上传平面图 / 截图' : 'Upload Floorplan / Screenshot'}
+          className={`${buttonSize} rounded-xl flex items-center justify-center transition-all border-t pt-2.5 mt-1 ${
+            'text-ink-muted hover:text-ink hover:bg-surface-hover border-line'
+          }`}
+        >
+          <ImagePlus className="w-4 h-4" />
+        </button>
+
+        {/* Hover Tooltip */}
+        <div className="absolute left-full top-1/2 -translate-y-1/2 ml-2 px-2.5 py-1 bg-slate-950 border border-slate-700 text-slate-200 text-xs rounded-lg shadow-xl whitespace-nowrap opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 flex items-center gap-1.5">
+          <span className="font-medium">{isZh ? '上传平面图 / 截图' : 'Upload Floorplan / Screenshot'}</span>
+        </div>
+      </div>
+
+      {/* Keyboard shortcuts — also on ? anywhere outside a text field */}
+      <div className="relative group mt-auto">
+        <button
+          type="button"
+          onClick={toggleShortcutSheet}
+          title={isZh ? '键盘快捷键（?）' : 'Keyboard shortcuts (?)'}
+          aria-label={isZh ? '键盘快捷键' : 'Keyboard shortcuts'}
+          className={`${buttonSize} rounded-xl flex items-center justify-center transition-all text-ink-muted hover:text-ink hover:bg-surface-hover`}
+        >
+          <Keyboard className="w-4 h-4" />
+        </button>
+        <div className="absolute left-full top-1/2 -translate-y-1/2 ml-2 px-2.5 py-1 bg-slate-950 border border-slate-700 text-slate-200 text-xs rounded-lg shadow-xl whitespace-nowrap opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 flex items-center gap-1.5">
+          <span className="font-medium">{isZh ? '键盘快捷键' : 'Keyboard shortcuts'}</span>
+          <kbd className="px-1.5 py-0.2 text-[10px] font-mono bg-slate-800 text-slate-400 rounded border border-slate-700">?</kbd>
+        </div>
+      </div>
+    </aside>
+  );
+};

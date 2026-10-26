@@ -1,0 +1,1708 @@
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  Camera,
+  Clapperboard,
+  Cloud,
+  Coffee,
+  Copy,
+  Download,
+  FileText,
+  FolderOpen,
+  HardDrive,
+  Heart,
+  History,
+  Layers,
+  Pencil,
+  Plus,
+  Save,
+  Server,
+  Trash2,
+  Upload,
+  X,
+  Languages,
+  Moon,
+  Sun,
+} from 'lucide-react';
+import { useFloorPlan } from '../../context/FloorPlanContext';
+import { APP_VERSION, SPONSOR_LINKS } from '../../config/version';
+import { GOOGLE_DRIVE_CLIENT_ID_DEFAULT } from '../../config/cloud';
+import { usePersistentUiState } from '../../utils/usePersistentUiState';
+import { exportProjectPackageV2 } from '../../utils/projectPackageV2';
+import {
+  backupAgeText,
+  backupIsStale,
+  getLastBackupAt,
+  recordBackup,
+} from '../../utils/cloud/backupHistory';
+import {
+  downloadDrivePackage,
+  isDriveConflict,
+  isDriveUnauthorized,
+  listDrivePackages,
+  requestDriveAccessToken,
+  revokeDriveAccessToken,
+  uploadProjectToDrive,
+  type DriveFileRef,
+} from '../../utils/cloud/googleDrive';
+import { saveCloudBase, readCloudBase } from '../../utils/cloud/cloudBases';
+import { threeWayMerge, resolveMergeConflicts, type MergeConflict } from '../../domain/sync/threeWayMerge';
+import { migrateProject } from '../../domain/migrations';
+import { MergeConflictDialog } from './MergeConflictDialog';
+import type { Project } from '../../types';
+import {
+  cloudCopyFileName,
+  planCloudSave,
+  readCloudLink,
+  writeCloudLink,
+  type CloudProvider,
+} from '../../utils/cloud/cloudLinks';
+import {
+  downloadWebdavPackage,
+  isWebdavConflict,
+  isWebdavUnauthorized,
+  listWebdavPackages,
+  uploadWebdavPackage,
+  type WebdavConfig,
+  type WebdavFile,
+} from '../../utils/cloud/webdav';
+import { listUnreadableProjects, readProject } from '../../utils/projectLibrary';
+import {
+  MODULE_PICKER_GROUPS,
+  PICKABLE_MODULES,
+  WORKSPACE_PRESETS,
+  getPreset,
+  type ModuleId,
+  type WorkspacePresetId,
+} from '../../domain/workspace';
+import { useDialogs } from '../dialog/DialogProvider';
+import {
+  applyAssetRemap,
+  bindNativeProjectHandle,
+  listRecentProjectFiles,
+  openNativeProjectFile,
+  parseProjectFileBytes,
+  supportsNativeProjectOpen,
+  type ParsedProjectFile,
+} from '../../utils/nativeProjectFile';
+import { useDialogFocusTrap } from '../../utils/useDialogFocusTrap';
+import { downloadBlob, safeFileName } from '../../utils/download';
+import { useWorkspaceUI } from '../../context/WorkspaceUIContext';
+import { useLanguage } from '../../i18n/LanguageContext';
+import { saveNativeProjectFile } from '../../utils/nativeProjectFile';
+import {
+  deleteOrphanedAssets,
+  inspectAssetStorage,
+  type AssetStorageInspection,
+} from '../../utils/assetStorageInspection';
+
+const triggerDownload = (blob: Blob, filename: string) => downloadBlob(blob, filename);
+
+/** localStorage key for the optionally remembered WebDAV password. */
+const NC_PASSWORD_KEY = 'openshotdesigner_ui_cloud.webdav.password';
+
+/** Human host for "Connected to …" (never the full credential path). */
+const hostOf = (baseUrl: string): string => {
+  try {
+    return new URL(baseUrl).host;
+  } catch {
+    return baseUrl;
+  }
+};
+
+const formatBytes = (bytes: number): string => {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+};
+
+const formatUpdated = (iso: string): string => {
+  if (!iso) return '—';
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return '—';
+  const minutes = Math.round((Date.now() - then) / 60000);
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 30) return `${days} d ago`;
+  return new Date(iso).toLocaleDateString();
+};
+
+/**
+ * Project dashboard: start a new production, or pick up an older one. Shown on
+ * first run and whenever the user opens "Projects" from the top bar.
+ */
+export const ProjectDashboard: React.FC = () => {
+  const { project, projects, activeProjectId, createNewProject, openProjectById, duplicateProject, renameProject, deleteProjectById, loadProjectFromJson, restoreRevision, applyMergedProject } = useFloorPlan();
+  const { isDashboardOpen, closeDashboard, theme, toggleTheme } = useWorkspaceUI();
+  const { lang, setLang, t } = useLanguage();
+  const { choose, notice } = useDialogs();
+
+  const isLight = theme === 'light';
+  const presetZh: Partial<Record<WorkspacePresetId, { label: string; description: string }>> = {
+    blank: { label: '空白平面图', description: '干净的平面图工作区，不强制创建人物、摄影机或镜头。' },
+    shot_planning: { label: '镜头规划 / 调度', description: '聚焦调度与覆盖：平面图、镜头表、剧本标线和故事板。' },
+    mff_s4_m2: { label: 'MFF S4-M2 二维调度', description: '人物走位、动作轴、摄影机安全区、镜头几何和 MFF 数据桥接。' },
+    full: { label: '完整制作', description: '开启全部模块，从剧本、预算到器材和通告单。' },
+    narrative: { label: '剧情片', description: '以剧本为核心，包含覆盖、排期和通告单。' },
+    documentary: { label: '纪录片', description: '访谈、段落和镜头规划，不要求完整剧本。' },
+    commercial: { label: '广告 / AV 剧本', description: '双栏 AV 剧本、故事板和器材规划流程。' },
+    interview: { label: '访谈', description: '精简的访谈平面图、摄影机和问题段落流程。' },
+    concert: { label: '演唱会 / 现场活动', description: '场馆、舞台、摄影机、灯光、DMX、供电、线缆和流程单。' },
+    broadcast: { label: '广播电视 / 转播', description: '演播室或转播区机位、信号流和演出日排期。' },
+    studio: { label: '演播室制作', description: '多机位演播室平面图与技术规划模块。' },
+    photo: { label: '摄影项目', description: '平面图、情绪板和灯光设置，不包含视频专属工具。' },
+    custom: { label: '自定义', description: '精确选择本项目显示的模块。' },
+  };
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [newTitle, setNewTitle] = useState('');
+  const [startWithSamples, setStartWithSamples] = useState(false);
+  // Read on every render rather than memoised: it is a Map spread, and the
+  // registry is filled by readProject as the library hydrates, so any memo key
+  // would be a guess about when that finished.
+  const unreadable = isDashboardOpen ? listUnreadableProjects() : [];
+  const [presetId, setPresetId] = useState<WorkspacePresetId>('mff_s4_m2');
+  /**
+   * Module selection for the Custom preset. Seeded from whichever preset was
+   * highlighted when Custom was picked, so "Narrative minus budget" is two
+   * clicks rather than fifteen.
+   */
+  const [customModules, setCustomModules] = useState<ModuleId[]>(
+    () => getPreset('mff_s4_m2').enabledModules,
+  );
+  const chooseCustom = () => {
+    setCustomModules(getPreset(presetId).enabledModules);
+    setPresetId('custom');
+  };
+  const toggleCustomModule = (moduleId: ModuleId, enabled: boolean) => {
+    setCustomModules((current) =>
+      enabled ? [...new Set([...current, moduleId])] : current.filter((id) => id !== moduleId),
+    );
+  };
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  /** Project whose revisions list is open (null = closed). */
+  const [revisionsProjectId, setRevisionsProjectId] = useState<string | null>(null);
+  /** Revision id awaiting restore confirmation. */
+  const [confirmRestoreId, setConfirmRestoreId] = useState<string | null>(null);
+  const [storageOpen, setStorageOpen] = useState(false);
+  const [driveOpen, setDriveOpen] = useState(false);
+  const [storageInspection, setStorageInspection] = useState<AssetStorageInspection | null>(null);
+  const [storageBusy, setStorageBusy] = useState(false);
+  const [confirmStorageCleanup, setConfirmStorageCleanup] = useState(false);
+  // Google Drive backup: the Client ID is a per-viewer preference (local,
+  // never project data); the access token lives in memory only and dies
+  // with the tab. No project state, no context growth.
+  const [driveClientId, setDriveClientId] = usePersistentUiState('cloud.drive.clientId', '');
+  const [driveToken, setDriveToken] = useState<string | null>(null);
+  const [driveConnecting, setDriveConnecting] = useState(false);
+  /** Project id currently uploading, or 'connect' while signing in. */
+  const [driveBusyId, setDriveBusyId] = useState<string | null>(null);
+  // Projects in the Drive app folder, for opening; listed on request.
+  const [driveFiles, setDriveFiles] = useState<DriveFileRef[]>([]);
+  const [driveListBusy, setDriveListBusy] = useState(false);
+  const [driveBusyFile, setDriveBusyFile] = useState<string | null>(null);
+  // An open merge: the conflicts to decide, and how to continue once decided.
+  const [pendingMerge, setPendingMerge] = useState<{
+    fileName: string;
+    theirChanges: number;
+    conflicts: MergeConflict[];
+    settle: (useTheirs: Set<number> | null) => void;
+  } | null>(null);
+  const askMergeChoices = (fileName: string, theirChanges: number, conflicts: MergeConflict[]) =>
+    new Promise<Set<number> | null>((resolve) => {
+      setPendingMerge({ fileName, theirChanges, conflicts, settle: (choice) => { setPendingMerge(null); resolve(choice); } });
+    });
+  /** Last backup clock for the stale-backup reminder; refreshed on open and after every local backup. */
+  const [backupAt, setBackupAt] = useState<string | null>(() => getLastBackupAt());
+  const refreshBackupAge = () => setBackupAt(getLastBackupAt());
+  useEffect(() => {
+    if (isDashboardOpen) refreshBackupAge();
+  }, [isDashboardOpen]);
+  const [cloudTab, setCloudTab] = useState<'drive' | 'nextcloud'>('drive');
+  // Nextcloud/WebDAV session: server and user are viewer preferences, the
+  // password persists only on request, the live session is memory-only.
+  const [ncUrl, setNcUrl] = usePersistentUiState('cloud.webdav.url', '');
+  const [ncUser, setNcUser] = usePersistentUiState('cloud.webdav.username', '');
+  const [ncRemember, setNcRemember] = usePersistentUiState('cloud.webdav.remember', false);
+  const [ncPassword, setNcPassword] = useState<string>(() => {
+    try {
+      return localStorage.getItem('openshotdesigner_ui_cloud.webdav.remember') === 'true'
+        ? (localStorage.getItem(NC_PASSWORD_KEY) ?? '')
+        : '';
+    } catch {
+      return '';
+    }
+  });
+  const [nextcloud, setNextcloud] = useState<WebdavConfig | null>(null);
+  const [ncFiles, setNcFiles] = useState<WebdavFile[]>([]);
+  const [ncBusy, setNcBusy] = useState(false);
+  const [ncBusyFile, setNcBusyFile] = useState<string | null>(null);
+  /** Project card whose save menu is open; the format resets to .osd every time it opens. */
+  const [saveMenuId, setSaveMenuId] = useState<string | null>(null);
+  const [saveFormat, setSaveFormat] = useState<'osd' | 'json'>('osd');
+  /** The owner's built-in ID wins unless a self-hoster typed their own. */
+  const hasBuiltInClientId = GOOGLE_DRIVE_CLIENT_ID_DEFAULT.trim() !== '';
+  const effectiveDriveClientId = driveClientId.trim() || GOOGLE_DRIVE_CLIENT_ID_DEFAULT.trim();
+  // The revisions list is the one true modal on this screen — it dims the
+  // dashboard behind it — so keyboard focus has to stay inside it while open.
+  const revisionsDialogRef = useDialogFocusTrap(revisionsProjectId !== null);
+  const storageDialogRef = useDialogFocusTrap(storageOpen);
+  const driveDialogRef = useDialogFocusTrap(driveOpen);
+
+  if (!isDashboardOpen) return null;
+
+  const handleCreate = () => {
+    createNewProject({
+      title: newTitle.trim() || 'Untitled production',
+      withSampleScenes: startWithSamples,
+      workspacePreset: presetId,
+      workspaceModules: presetId === 'custom' ? customModules : undefined,
+    });
+    setNewTitle('');
+  };
+
+  const handleCreateMffDemo = () => {
+    createNewProject({
+      title: 'MFF S4-M2 案例｜深夜路边摊',
+      withMffDemo: true,
+      workspacePreset: 'mff_s4_m2',
+    });
+  };
+
+  /** Commit a parsed file: register media, remap upgraded ids, load, optionally bind. */
+  /** Import a parsed file as a project; resolves to its id, or null when it failed. */
+  const commitParsedFile = async (
+    parsed: ParsedProjectFile,
+    bind?: { fileName: string; handle: unknown },
+  ): Promise<string | null> => {
+    const remapped = await parsed.importAssets();
+    const finalProject = applyAssetRemap(parsed.project, remapped);
+    const result = loadProjectFromJson(finalProject);
+    if (!result.ok) {
+      await notice({ title: 'Import failed', message: result.message });
+      return null;
+    }
+    if (bind) bindNativeProjectHandle(result.project.id, bind.fileName, bind.handle);
+    return result.project.id;
+  };
+
+  const handleImport = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    // Read as bytes, not text: v2 packages are ZIP archives. Format is
+    // sniffed from the content so a renamed file still imports correctly.
+    void (async () => {
+      try {
+        await commitParsedFile(await parseProjectFileBytes(await file.arrayBuffer()));
+      } catch (err) {
+        await notice({
+          title: 'Import failed',
+          message: err instanceof Error ? err.message : 'unknown error',
+        });
+      }
+    })();
+    event.target.value = '';
+  };
+
+  /** Native Open…: pick a file with a bound handle so Ctrl+S writes back to it. */
+  const handleNativeOpen = () => {
+    void (async () => {
+      try {
+        const opened = await openNativeProjectFile();
+        if (!opened) {
+          // No File System Access API here — fall back to the classic input.
+          fileInputRef.current?.click();
+          return;
+        }
+        const remapped = opened.remapped;
+        const finalProject = applyAssetRemap(opened.project, remapped);
+        const result = loadProjectFromJson(finalProject);
+        if (!result.ok) {
+          await notice({ title: 'Import failed', message: result.message });
+          return;
+        }
+        bindNativeProjectHandle(result.project.id, opened.fileName, opened.handle);
+      } catch (err) {
+        if ((err as Error)?.name === 'AbortError') return;
+        await notice({
+          title: 'Import failed',
+          message: err instanceof Error ? err.message : 'unknown error',
+        });
+      }
+    })();
+  };
+
+  const downloadProject = (id: string) => {
+    const project = readProject(id);
+    if (!project) return;
+    const blob = new Blob([JSON.stringify(project, null, 2)], { type: 'application/json' });
+    triggerDownload(blob, `${safeFileName(project.title, 'project').toLowerCase()}_openshotdesigner.json`);
+    recordBackup();
+    refreshBackupAge();
+  };
+
+  /** Full portable package: project + referenced assets (plan §5.2.2). */
+  const downloadProjectPackage = (id: string) => {
+    const project = readProject(id);
+    if (!project) return;
+    // Library exports must not steal Ctrl+S's binding from the open workspace.
+    // saveNativeProjectFile stamps the backup clock itself on success.
+    void saveNativeProjectFile(project, { saveAs: true, bindHandle: false })
+      .then(() => refreshBackupAge())
+      .catch((error) => {
+      if ((error as Error)?.name !== 'AbortError') {
+        void notice({
+          title: 'Project save failed',
+          message: error instanceof Error ? error.message : 'unknown error',
+        });
+      }
+    });
+  };
+
+  const connectDrive = async () => {
+    setDriveConnecting(true);
+    try {
+      setDriveToken(await requestDriveAccessToken(effectiveDriveClientId));
+    } catch (error) {
+      await notice({
+        title: 'Google Drive',
+        message: error instanceof Error ? error.message : 'Sign-in failed.',
+      });
+    } finally {
+      setDriveConnecting(false);
+    }
+  };
+
+  const disconnectDrive = () => {
+    if (driveToken) void revokeDriveAccessToken(driveToken);
+    setDriveToken(null);
+    setDriveFiles([]);
+  };
+
+  /** A Drive call with one silent token refresh: the hour-long token may have expired between visits. */
+  const withDriveToken = async <T,>(call: (token: string) => Promise<T>): Promise<T> => {
+    if (!driveToken) throw new Error('Not connected to Google Drive.');
+    try {
+      return await call(driveToken);
+    } catch (error) {
+      if (!isDriveUnauthorized(error)) throw error;
+      const fresh = await requestDriveAccessToken(effectiveDriveClientId, { silent: true });
+      setDriveToken(fresh);
+      return call(fresh);
+    }
+  };
+
+  const refreshDriveFileList = async () => {
+    setDriveListBusy(true);
+    try {
+      setDriveFiles(await withDriveToken((token) => listDrivePackages(token)));
+    } catch (error) {
+      if (isDriveUnauthorized(error)) setDriveToken(null);
+      await notice({ title: 'Google Drive', message: error instanceof Error ? error.message : 'The file list could not be loaded.' });
+    } finally {
+      setDriveListBusy(false);
+    }
+  };
+
+  /** Open a Drive project here, remembering which file and version it came from. */
+  const importDriveFile = async (file: DriveFileRef) => {
+    setDriveBusyFile(file.id);
+    try {
+      const blob = await withDriveToken((token) => downloadDrivePackage(token, file.id));
+      const projectId = await commitParsedFile(await parseProjectFileBytes(await blob.arrayBuffer()));
+      if (projectId) {
+        writeCloudLink(projectId, 'drive', { fileName: file.name, fileId: file.id, ...(file.modifiedTime ? { version: file.modifiedTime } : {}) });
+        const opened = readProject(projectId);
+        if (opened) await saveCloudBase(projectId, 'drive', opened);
+        await notice({ title: 'Opened from Google Drive', message: `${file.name} is now a project in this browser. Saving it to Drive again updates that file, and asks first if someone else saved it in the meantime.` });
+      }
+    } catch (error) {
+      await notice({ title: 'Open failed', message: error instanceof Error ? error.message : 'unknown error' });
+    } finally {
+      setDriveBusyFile(null);
+    }
+  };
+
+  /**
+   * Save a project to Drive or Nextcloud. A file this browser opened or saved
+   * before is updated only if nobody saved it since (otherwise: save ours as a
+   * copy, or replace theirs). A same-named file this browser never saw is
+   * never replaced without asking.
+   */
+  const saveProjectToCloud = async (id: string, provider: CloudProvider) => {
+    const label = provider === 'drive' ? 'Google Drive' : 'Nextcloud';
+    const server = nextcloud;
+    if (provider === 'drive' ? !driveToken : !server) {
+      await notice({ title: label, message: 'Open the Cloud button above and connect first.' });
+      return;
+    }
+    // The open project is read live: the library copy can trail it by a debounce.
+    const stored = id === project.id ? project : readProject(id);
+    if (!stored) return;
+    setDriveBusyId(id);
+    try {
+      const packageBlob = await exportProjectPackageV2(stored);
+      const defaultName = `${safeFileName(stored.title, 'project').toLowerCase()}.osd`;
+      const link = readCloudLink(id, provider);
+      const remote = provider === 'drive'
+        ? (await withDriveToken((token) => listDrivePackages(token))).map((file) => ({ name: file.name, modified: file.modifiedTime }))
+        : (await listWebdavPackages(server as WebdavConfig)).map((file) => ({ name: file.name, modified: file.modified }));
+      const plan = planCloudSave(link, defaultName, remote);
+      let fileName = plan.fileName;
+      // 'checked' saves only over the version we know (or over nothing); 'replace' overwrites.
+      let mode: 'checked' | 'replace' = 'checked';
+      if (plan.kind === 'ask') {
+        const choice = await choose({
+          title: 'A file with this name is already there',
+          message: `${fileName} is already in the OpenShotDesigner folder${plan.remoteModified ? ` (saved ${new Date(plan.remoteModified).toLocaleString()})` : ''}.\n\nIt may be an older backup of this project, or someone else's work.`,
+          confirmLabel: 'Replace it',
+          alternativeLabel: 'Save as a copy',
+          danger: true,
+        });
+        if (choice === 'cancel') return;
+        if (choice === 'alternative') fileName = cloudCopyFileName(fileName);
+        else mode = 'replace';
+      }
+
+      const upload = async (name: string, how: 'checked' | 'replace', blob: Blob = packageBlob, expectedVersion?: string): Promise<{ version?: string; fileId?: string }> => {
+        const expected = how === 'replace' ? undefined : expectedVersion ?? (plan.kind === 'update' && name === plan.fileName ? plan.version : null);
+        const packageBlob = blob;
+        if (provider === 'drive') {
+          const ref = await withDriveToken((token) => uploadProjectToDrive({
+            accessToken: token,
+            fileName: name,
+            packageBlob,
+            ...(expected === undefined ? {} : { expectedModifiedTime: expected }),
+          }));
+          return { fileId: ref.id, ...(ref.modifiedTime ? { version: ref.modifiedTime } : {}) };
+        }
+        const precondition = expected === undefined ? undefined : expected === null ? { ifNoneMatch: true as const } : { ifMatch: expected };
+        const saved = await uploadWebdavPackage(server as WebdavConfig, name, packageBlob, fetch, precondition);
+        // Not every server returns the new ETag on PUT; read it back from the listing.
+        const version = saved.etag ?? (await listWebdavPackages(server as WebdavConfig)).find((file) => file.name === name)?.etag;
+        return version ? { version } : {};
+      };
+
+      let result: { version?: string; fileId?: string };
+      let savedProject: Project = stored;
+      try {
+        result = await upload(fileName, mode);
+      } catch (error) {
+        if (!(provider === 'drive' ? isDriveConflict(error) : isWebdavConflict(error))) throw error;
+        // Someone saved since. With the copy both started from, merge.
+        const base = plan.kind === 'update' ? await readCloudBase(id, provider) : undefined;
+        if (base) {
+          const remote = provider === 'drive'
+            ? (await withDriveToken((token) => listDrivePackages(token))).find((file) => file.name === fileName)
+            : undefined;
+          const remoteWebdav = provider === 'webdav'
+            ? (await listWebdavPackages(server as WebdavConfig)).find((file) => file.name === fileName)
+            : undefined;
+          const theirVersion = remote?.modifiedTime ?? remoteWebdav?.etag;
+          const theirBlob = provider === 'drive'
+            ? (remote ? await withDriveToken((token) => downloadDrivePackage(token, remote.id)) : undefined)
+            : await downloadWebdavPackage(server as WebdavConfig, fileName);
+          if (theirBlob && theirVersion) {
+            const parsed = await parseProjectFileBytes(await theirBlob.arrayBuffer());
+            const theirs = migrateProject(applyAssetRemap(parsed.project, await parsed.importAssets())).project;
+            const { merged, conflicts, theirChanges } = threeWayMerge<Project>(base, stored, theirs);
+            let final = merged;
+            if (conflicts.length > 0) {
+              const choice = await askMergeChoices(fileName, theirChanges, conflicts);
+              if (!choice) return;
+              final = resolveMergeConflicts(merged, conflicts, choice);
+            }
+            final = { ...final, id };
+            applyMergedProject(id, final, `Merge ${theirChanges} change${theirChanges === 1 ? '' : 's'} from ${label}`);
+            result = await upload(fileName, 'checked', await exportProjectPackageV2(final), theirVersion);
+            savedProject = final;
+            writeCloudLink(id, provider, { fileName, ...result });
+            await saveCloudBase(id, provider, final);
+            recordBackup();
+            refreshBackupAge();
+            if (provider === 'drive') void refreshDriveFileList();
+            else await refreshNcFileList(server as WebdavConfig);
+            await notice({
+              title: `Merged and saved to ${label}`,
+              message: `${theirChanges} change${theirChanges === 1 ? '' : 's'} from the newer copy merged in${conflicts.length ? `, ${conflicts.length} decided by you` : ''}. Undo (Ctrl+Z) takes the merge back out of this project.`,
+            });
+            return;
+          }
+        }
+        const choice = await choose({
+          title: 'Someone saved a newer copy',
+          message: `${fileName} on ${label} was saved again since you opened it here. Saving now would replace that work.\n\nSave yours as a copy to keep both, then compare them.`,
+          confirmLabel: 'Replace theirs',
+          alternativeLabel: 'Save mine as a copy',
+          danger: true,
+        });
+        if (choice === 'cancel') return;
+        if (choice === 'alternative') {
+          fileName = cloudCopyFileName(fileName);
+          result = await upload(fileName, 'checked');
+        } else {
+          result = await upload(fileName, 'replace');
+        }
+      }
+
+      writeCloudLink(id, provider, { fileName, ...result });
+      await saveCloudBase(id, provider, savedProject);
+      recordBackup();
+      refreshBackupAge();
+      if (provider === 'drive') void refreshDriveFileList();
+      else await refreshNcFileList(server as WebdavConfig);
+      await notice({ title: `Saved to ${label}`, message: `${fileName} is saved in the OpenShotDesigner folder.` });
+    } catch (error) {
+      if (provider === 'drive' && isDriveUnauthorized(error)) setDriveToken(null);
+      if (provider === 'webdav' && isWebdavUnauthorized(error)) setNextcloud(null);
+      await notice({
+        title: `${label} upload failed`,
+        message: error instanceof Error ? error.message : 'The upload could not be completed.',
+      });
+    } finally {
+      setDriveBusyId(null);
+    }
+  };
+
+  const uploadProjectToDriveHandler = (id: string) => saveProjectToCloud(id, 'drive');
+
+  const refreshNcFileList = async (config: WebdavConfig = {
+    baseUrl: ncUrl,
+    username: ncUser,
+    password: ncPassword,
+  }): Promise<void> => {
+    setNcBusy(true);
+    try {
+      setNcFiles(await listWebdavPackages(config));
+    } catch (error) {
+      await notice({
+        title: 'Nextcloud',
+        message: error instanceof Error ? error.message : 'The file list could not be loaded.',
+      });
+    } finally {
+      setNcBusy(false);
+    }
+  };
+
+  const connectNextcloud = async () => {
+    setNcBusy(true);
+    try {
+      const config: WebdavConfig = { baseUrl: ncUrl, username: ncUser, password: ncPassword };
+      const files = await listWebdavPackages(config);
+      setNextcloud(config);
+      setNcFiles(files);
+      try {
+        if (ncRemember) localStorage.setItem(NC_PASSWORD_KEY, ncPassword);
+        else localStorage.removeItem(NC_PASSWORD_KEY);
+      } catch {
+        // Convenience only — the session works without it.
+      }
+    } catch (error) {
+      await notice({
+        title: 'Nextcloud',
+        message: error instanceof Error ? error.message : 'Sign-in failed.',
+      });
+    } finally {
+      setNcBusy(false);
+    }
+  };
+
+  const disconnectNextcloud = () => {
+    setNextcloud(null);
+    setNcFiles([]);
+    if (!ncRemember) setNcPassword('');
+  };
+
+  const uploadProjectToNextcloud = (id: string) => saveProjectToCloud(id, 'webdav');
+
+  /** Restore a server backup into this browser, through the file-import path. */
+  const importWebdavFile = async (file: WebdavFile) => {
+    if (!nextcloud) return;
+    setNcBusyFile(file.name);
+    try {
+      const blob = await downloadWebdavPackage(nextcloud, file.name);
+      const projectId = await commitParsedFile(await parseProjectFileBytes(await blob.arrayBuffer()));
+      if (projectId) {
+        writeCloudLink(projectId, 'webdav', { fileName: file.name, ...(file.etag ? { version: file.etag } : {}) });
+        const opened = readProject(projectId);
+        if (opened) await saveCloudBase(projectId, 'webdav', opened);
+        await notice({ title: 'Opened from Nextcloud', message: `${file.name} is now a project in this browser. Saving it to Nextcloud again updates that file, and asks first if someone else saved it in the meantime.` });
+      }
+    } catch (error) {
+      await notice({
+        title: 'Import failed',
+        message: error instanceof Error ? error.message : 'unknown error',
+      });
+    } finally {
+      setNcBusyFile(null);
+    }
+  };
+
+  /** Save menu choice: .osd is the default, JSON takes an explicit switch. */
+  const runSaveMenu = (id: string) => {
+    if (saveFormat === 'json') downloadProject(id);
+    else downloadProjectPackage(id);
+    setSaveMenuId(null);
+  };
+
+  const revisionsProject = revisionsProjectId ? readProject(revisionsProjectId) : null;  const revisionsList = revisionsProject?.revisions || [];
+
+  const handleRestore = (revisionId: string) => {
+    if (!revisionsProjectId) return;
+    restoreRevision(revisionId, revisionsProjectId);
+    setConfirmRestoreId(null);
+    setRevisionsProjectId(null);
+  };
+
+  const scanStorage = async () => {
+    setStorageBusy(true);
+    try {
+      const saved = projects
+        .map((entry) => (entry.id === project.id ? project : readProject(entry.id)))
+        .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+      setStorageInspection(await inspectAssetStorage(saved));
+    } finally {
+      setStorageBusy(false);
+    }
+  };
+
+  const openStorage = () => {
+    setStorageOpen(true);
+    setConfirmStorageCleanup(false);
+    void scanStorage();
+  };
+
+  const cleanStorage = async () => {
+    if (!storageInspection?.orphanedIds.length) return;
+    setStorageBusy(true);
+    try {
+      await deleteOrphanedAssets(storageInspection.orphanedIds);
+      setConfirmStorageCleanup(false);
+      await scanStorage();
+    } finally {
+      setStorageBusy(false);
+    }
+  };
+
+  const panel = 'bg-surface border-line text-ink';
+  const field = `w-full rounded-lg border px-2.5 py-2 text-sm ${
+    'bg-field border-line-strong'
+  }`;
+  const ghostButton = `px-2 py-1 rounded-lg border text-[11px] font-semibold flex items-center gap-1 transition-colors ${
+    'border-line-strong hover:bg-surface-hover'
+  }`;
+
+  return (
+    <div
+      id="project-dashboard"
+      className={`fixed inset-0 z-[70] overflow-y-auto bg-surface-sunken`}
+    >
+      <div className="max-w-5xl mx-auto px-4 py-6 sm:px-6 sm:py-10">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-3 mb-6">
+          <div className="flex items-center gap-3">
+            <div className="p-2.5 rounded-2xl bg-sky-500/15 text-accent-ink border border-sky-500/30">
+              <Clapperboard className="w-6 h-6" />
+            </div>
+            <div>
+              <h1 className="text-lg sm:text-xl font-black tracking-tight uppercase">{t('dashboard.title')}</h1>
+              <p className={`text-xs text-ink-muted`}>
+                {t('dashboard.subtitle')}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setLang(lang === 'zh' ? 'en' : 'zh')}
+              title={lang === 'zh' ? t('nav.languageToEnglish') : t('nav.languageToChinese')}
+              aria-label={lang === 'zh' ? t('nav.languageToEnglish') : t('nav.languageToChinese')}
+              className="px-2.5 py-2 rounded-lg border text-xs font-semibold flex items-center gap-1.5 border-line-strong hover:bg-surface-muted"
+            >
+              <Languages className="w-4 h-4" /> {lang === 'zh' ? 'EN' : '中'}
+            </button>
+            <button
+              type="button"
+              onClick={toggleTheme}
+              title={isLight ? t('theme.toDark') : t('theme.toLight')}
+              aria-label={isLight ? t('theme.toDark') : t('theme.toLight')}
+              className="px-2.5 py-2 rounded-lg border text-xs font-semibold flex items-center gap-1.5 border-line-strong hover:bg-surface-muted"
+            >
+              {isLight ? <Moon className="w-4 h-4" /> : <Sun className="w-4 h-4" />}
+              <span className="hidden sm:inline">{isLight ? t('theme.dark') : t('theme.light')}</span>
+            </button>
+            <button
+              onClick={() => setDriveOpen(true)}
+              title={lang === 'zh' ? ((driveToken || nextcloud) ? '云端备份：已连接，管理备份' : '云端备份：登录并保存 .osd 包') : ((driveToken || nextcloud) ? 'Cloud backup: connected — manage backups' : 'Cloud backup: sign in and save .osd packages')}
+              aria-label={lang === 'zh' ? '云端备份' : 'Cloud backup'}
+              className={`px-2.5 py-2 rounded-lg border text-xs font-semibold flex items-center gap-1.5 border-line-strong hover:bg-slate-200 dark:hover:bg-slate-800`}
+            >
+              <Cloud className={`w-4 h-4 ${driveToken || nextcloud ? 'text-emerald-500' : 'text-sky-500'}`} /> {lang === 'zh' ? '云端' : 'Cloud'}
+              {(driveToken || nextcloud) && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" aria-hidden />}
+            </button>
+            <button
+              onClick={openStorage}
+              title={lang === 'zh' ? '检查浏览器媒体存储' : 'Inspect browser media storage'}
+              className={`px-2.5 py-2 rounded-lg border text-xs font-semibold flex items-center gap-1.5 border-line-strong hover:bg-surface-muted`}
+            >
+              <HardDrive className="w-4 h-4" /> {lang === 'zh' ? '存储' : 'Storage'}
+            </button>
+            {projects.length > 0 && (
+              <button
+                onClick={closeDashboard}
+                title={t('dashboard.back')}
+                aria-label={t('dashboard.back')}
+                className={`p-2 rounded-lg border border-line-strong hover:bg-surface-muted`}
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* New project */}
+        <div className={`border rounded-2xl p-4 mb-6 shadow-sm ${panel}`}>
+          <div className="mb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-lg border border-emerald-500/40 bg-emerald-500/10 p-3">
+            <div>
+              <div className="text-sm font-bold">{t('dashboard.demoTitle')}</div>
+              <p className="mt-1 text-[11px] text-ink-muted">{t('dashboard.demoDescription')}</p>
+            </div>
+            <button
+              type="button"
+              onClick={handleCreateMffDemo}
+              className="shrink-0 px-3 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-bold"
+            >
+              {t('dashboard.openDemo')}
+            </button>
+          </div>
+          <h2 className="text-xs font-bold uppercase tracking-wide mb-3 flex items-center gap-2">
+            <Plus className="w-4 h-4 text-accent-ink" /> {t('dashboard.new')}
+          </h2>
+          <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
+            <input
+              value={newTitle}
+              onChange={(event) => setNewTitle(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') handleCreate();
+              }}
+              placeholder={lang === 'zh' ? '项目名称（例如：深夜路边摊）' : 'Production title (e.g. The Long Walk Home)'}
+              className={`${field} sm:flex-1`}
+            />
+            <button
+              onClick={handleCreate}
+              className="px-4 py-2 rounded-lg bg-accent hover:bg-accent-hover text-white text-sm font-semibold flex items-center justify-center gap-1.5"
+            >
+              <Plus className="w-4 h-4" /> {t('dashboard.create')}
+            </button>
+            <button onClick={() => fileInputRef.current?.click()} className={`${ghostButton} justify-center py-2`}>
+              <FolderOpen className="w-3.5 h-3.5" /> {t('dashboard.import')}
+            </button>
+            {supportsNativeProjectOpen() && (
+              <button
+                onClick={handleNativeOpen}
+                title={lang === 'zh' ? '打开可回写的 .osd 文件：Ctrl+S 保存到同一文件' : 'Open a .osd file with write-back: Ctrl+S saves into the same file'}
+                className={`${ghostButton} justify-center py-2`}
+              >
+                <FolderOpen className="w-3.5 h-3.5" /> {lang === 'zh' ? '打开…' : 'Open…'}
+              </button>
+            )}
+            <input ref={fileInputRef} type="file" accept=".osd,.json,application/json" onChange={handleImport} className="hidden" />
+          </div>
+          {listRecentProjectFiles().length > 0 && (
+            <div className="mt-3 text-[11px] opacity-80">
+              <span className="font-bold uppercase tracking-wide text-[10px]">Recent files: </span>
+              {listRecentProjectFiles().map((entry) => (
+                <button
+                  key={`${entry.fileName}-${entry.savedAt}`}
+                  onClick={handleNativeOpen}
+                  title={`Locate ${entry.fileName} (${formatUpdated(entry.savedAt)})`}
+                  className="underline underline-offset-2 hover:opacity-100 mr-3"
+                >
+                  {entry.fileName}
+                </button>
+              ))}
+            </div>
+          )}
+          <label className="mt-3 flex items-center gap-2 text-[11px] cursor-pointer w-fit">
+            <input
+              type="checkbox"
+              checked={startWithSamples}
+              onChange={(event) => setStartWithSamples(event.target.checked)}
+              className="accent-sky-600"
+            />
+            <span className="text-ink-soft">
+              {lang === 'zh' ? '使用示例场景（对白覆盖 + 黑色审讯）开始，而不是空白舞台' : 'Start with the example scenes (dialogue coverage + noir interrogation) instead of an empty stage'}
+            </span>
+          </label>
+
+          {/* Workspace preset (plan §1.2): configures module visibility only */}
+          <div className="mt-4">
+            <div className="text-[10px] font-bold uppercase tracking-wide opacity-60 mb-1.5">
+              {t('dashboard.workspacePreset')}
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {WORKSPACE_PRESETS.map((preset) => (
+                <button
+                  key={preset.id}
+                  onClick={() => (preset.id === 'custom' ? chooseCustom() : setPresetId(preset.id))}
+                  title={lang === 'zh' ? (presetZh[preset.id]?.description ?? preset.description) : preset.description}
+                  className={`px-2.5 py-1 rounded-full text-[11px] font-semibold border transition-colors ${
+                    presetId === preset.id
+                      ? 'bg-sky-700 border-sky-500 text-white'
+                      : isLight
+                        ? 'border-slate-300 text-slate-600 hover:bg-slate-100'
+                        : 'border-slate-700 text-slate-300 hover:bg-slate-800'
+                  }`}
+                >
+                  {lang === 'zh' ? (presetZh[preset.id]?.label ?? preset.label) : preset.label}
+                </button>
+              ))}
+            </div>
+            {presetId === 'custom' && (
+              <div
+                className={`mt-2.5 rounded-lg border p-2.5 ${
+                  'border-line bg-surface-sunken'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <div className="text-[10px] font-bold uppercase tracking-wide opacity-60">
+                    Modules to show
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setCustomModules(PICKABLE_MODULES.map((module) => module.id))}
+                      className={`px-2 py-0.5 rounded-md text-[10px] font-bold border ${
+                        'border-line-strong hover:bg-surface-muted'
+                      }`}
+                    >
+                      All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCustomModules([])}
+                      className={`px-2 py-0.5 rounded-md text-[10px] font-bold border ${
+                        'border-line-strong hover:bg-surface-muted'
+                      }`}
+                    >
+                      None
+                    </button>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-3 gap-y-2">
+                  {MODULE_PICKER_GROUPS.map((group) => (
+                    <section key={group.label}>
+                      <div className="text-[10px] font-black uppercase tracking-[0.14em] opacity-40 mb-1">
+                        {group.label}
+                      </div>
+                      {group.modules.map((module) => (
+                        <label
+                          key={module.id}
+                          className="flex items-center gap-1.5 cursor-pointer text-[11px] min-w-0 py-0.5"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={customModules.includes(module.id)}
+                            onChange={(event) => toggleCustomModule(module.id, event.target.checked)}
+                            className="rounded accent-sky-500 w-3.5 h-3.5 cursor-pointer flex-shrink-0"
+                          />
+                          <span className="truncate">{module.label}</span>
+                        </label>
+                      ))}
+                    </section>
+                  ))}
+                </div>
+                <p className={`mt-2 text-[10px] text-ink-subtle`}>
+                  The floor plan and Inspector are always available.
+                </p>
+              </div>
+            )}
+            <p className={`mt-2 text-[10px] text-ink-subtle`}>
+              {getPreset(presetId).description} {lang === 'zh' ? '预设只决定默认显示哪些工具，之后仍可随时启用或隐藏模块。' : 'Presets only change which tools are shown — you can enable or hide modules at any time.'}
+            </p>
+          </div>
+        </div>
+
+        {/* Cloud export lives behind the Google button in the header now. */}
+
+        {/* Projects that exist but could not be migrated. Previously these were
+            indistinguishable from "not found", so a production simply appeared
+            to have vanished. The stored data is untouched; say so plainly. */}
+        {unreadable.length > 0 && (
+          <div
+            className={`mb-4 rounded-2xl border p-4 ${
+              'border-amber-300 dark:border-amber-800 bg-warn-soft text-amber-900 dark:text-amber-100'
+            }`}
+          >
+            <h2 className="text-xs font-bold uppercase tracking-wide flex items-center gap-2">
+              <Clapperboard className="w-4 h-4" />
+              {unreadable.length} project{unreadable.length === 1 ? '' : 's'} could not be opened
+            </h2>
+            <ul className="mt-2 space-y-1.5 text-xs">
+              {unreadable.map((entry) => (
+                <li key={entry.id}>
+                  <strong>{entry.title}</strong>
+                  {entry.schemaVersion !== null && ` — saved with schema v${entry.schemaVersion}`}
+                  <div className="opacity-80">{entry.message}</div>
+                  {entry.issues.length > 0 && (
+                    <ul className="mt-0.5 ml-4 list-disc opacity-70">
+                      {entry.issues.slice(0, 4).map((issue) => (
+                        <li key={issue}>{issue}</li>
+                      ))}
+                    </ul>
+                  )}
+                </li>
+              ))}
+            </ul>
+            <p className="mt-2 text-[11px] opacity-80">
+              Nothing has been deleted or rewritten — the saved data is exactly as it was. This usually
+              means the file came from a newer build.
+            </p>
+          </div>
+        )}
+
+        {/* Saved projects */}
+        {projects.length > 0 && backupIsStale(backupAt) && (
+          <div
+            className={`mb-4 rounded-2xl border p-3.5 flex items-center gap-2.5 ${
+              'border-amber-300 dark:border-amber-800 bg-warn-soft text-amber-900 dark:text-amber-100'
+            }`}
+          >
+            <History className="w-4 h-4 flex-shrink-0" />
+            <p className="text-xs">
+              <strong>{lang === 'zh' ? `上次备份：${backupAgeText(backupAt)}。` : `Last backup ${backupAgeText(backupAt)}.`}</strong> {lang === 'zh' ? '项目目前只保存在此浏览器中，请使用下方项目卡片中的项目包、文件或云端按钮备份，也可使用顶部的云端按钮。' : "Your productions live in this browser only — back them up with a project's package, file or cloud buttons below, or the Cloud button on top."}
+            </p>
+          </div>
+        )}
+        <h2 className="text-xs font-bold uppercase tracking-wide mb-2 opacity-70">
+          {t('dashboard.savedProjects')} {projects.length > 0 && `(${projects.length})`}
+        </h2>
+
+        {projects.length === 0 ? (
+          <div
+            className={`border border-dashed rounded-2xl p-10 text-center ${
+              isLight ? 'border-slate-300 bg-white text-slate-500' : 'border-slate-700 text-slate-400'
+            }`}
+          >
+            <Clapperboard className="w-8 h-8 mx-auto mb-2 opacity-40" />
+            <p className="text-sm font-semibold">{t('dashboard.noProjects')}</p>
+            <p className="text-xs mt-1">{t('dashboard.noProjectsHint')}</p>
+          </div>
+        ) : (
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {projects.map((entry) => {
+              const isActive = entry.id === activeProjectId;
+              return (
+                <div
+                  key={entry.id}
+                  className={`relative border rounded-2xl p-3.5 flex flex-col gap-2.5 shadow-sm transition-colors ${panel} ${
+                    isActive ? 'ring-2 ring-sky-500/60' : ''
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    {renamingId === entry.id ? (
+                      <input
+                        autoFocus
+                        value={renameValue}
+                        onChange={(event) => setRenameValue(event.target.value)}
+                        onBlur={() => {
+                          renameProject(entry.id, renameValue);
+                          setRenamingId(null);
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            renameProject(entry.id, renameValue);
+                            setRenamingId(null);
+                          }
+                          if (event.key === 'Escape') setRenamingId(null);
+                        }}
+                        className={`${field} py-1 text-sm font-semibold`}
+                      />
+                    ) : (
+                      <button
+                        onClick={() => openProjectById(entry.id)}
+                        className="text-left font-bold text-sm leading-snug hover:text-sky-500 transition-colors"
+                      >
+                        {entry.title}
+                      </button>
+                    )}
+                    {isActive && (
+                      <span className="px-1.5 py-0.5 rounded-full bg-sky-500/15 text-accent-ink text-[10px] font-bold uppercase flex-shrink-0">
+                        {t('dashboard.open')}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className={`flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-ink-muted`}>
+                    <span className="flex items-center gap-1">
+                      <Layers className="w-3 h-3" /> {entry.setupCount} {lang === 'zh' ? '场' : `scene${entry.setupCount === 1 ? '' : 's'}`}
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <Camera className="w-3 h-3" /> {entry.shotCount} {lang === 'zh' ? '镜' : `shot${entry.shotCount === 1 ? '' : 's'}`}
+                    </span>
+                    {entry.hasScript && (
+                      <span className="flex items-center gap-1 text-violet-500">
+                        <FileText className="w-3 h-3" /> {lang === 'zh' ? '剧本' : 'script'}
+                      </span>
+                    )}
+                  </div>
+                  <p className={`text-[10px] text-ink-subtle`}>
+                    {entry.director ? `${entry.director} · ` : ''}{lang === 'zh' ? `保存于 ${formatUpdated(entry.updatedAt)}` : `saved ${formatUpdated(entry.updatedAt)}`}
+                  </p>
+
+                  <div className="flex flex-wrap items-center gap-1.5 mt-auto pt-1">
+                    <button
+                      onClick={() => openProjectById(entry.id)}
+                      className="px-2.5 py-1 rounded-lg bg-accent hover:bg-accent-hover text-white text-[11px] font-semibold"
+                    >
+                      {isActive ? t('dashboard.continue') : t('dashboard.open')}
+                    </button>
+                    <button
+                      onClick={() => {
+                        setRenamingId(entry.id);
+                        setRenameValue(entry.title);
+                      }}
+                      title={lang === 'zh' ? '重命名' : 'Rename'}
+                      aria-label={lang === 'zh' ? '重命名' : 'Rename'}
+                      className={ghostButton}
+                    >
+                      <Pencil className="w-3 h-3" />
+                    </button>
+                    <button onClick={() => duplicateProject(entry.id)} title={lang === 'zh' ? '复制' : 'Duplicate'} aria-label={lang === 'zh' ? '复制' : 'Duplicate'} className={ghostButton}>
+                      <Copy className="w-3 h-3" />
+                    </button>
+                    <div className="relative">
+                      <button
+                        onClick={() => {
+                          setSaveFormat('osd');
+                          setSaveMenuId(saveMenuId === entry.id ? null : entry.id);
+                        }}
+                        title="Save project file (.osd recommended)"
+                        aria-label="Save project file"
+                        aria-expanded={saveMenuId === entry.id}
+                        className={ghostButton}
+                      >
+                        <Save className="w-3 h-3" />
+                      </button>
+                      {saveMenuId === entry.id && (
+                        <>
+                          <div className="fixed inset-0 z-40" onClick={() => setSaveMenuId(null)} />
+                          <div
+                            role="dialog"
+                            aria-label="Save project file format"
+                            className={`absolute left-0 top-full mt-1.5 w-60 border rounded-xl shadow-2xl p-2.5 z-50 space-y-1 ${
+                              'bg-surface border-line text-slate-800 dark:text-slate-100'
+                            }`}
+                          >
+                            <label className={`flex items-start gap-2 p-2 rounded-lg cursor-pointer text-xs hover:bg-surface-hover`}>
+                              <input
+                                type="radio"
+                                name={`save-format-${entry.id}`}
+                                checked={saveFormat === 'osd'}
+                                onChange={() => setSaveFormat('osd')}
+                                className="accent-sky-600 mt-0.5"
+                              />
+                              <span>
+                                <strong>.osd package</strong>
+                                <span className={`block text-[10px] text-ink-muted`}>
+                                  Project + all images. The backup to take.
+                                </span>
+                              </span>
+                            </label>
+                            <label className={`flex items-start gap-2 p-2 rounded-lg cursor-pointer text-xs hover:bg-surface-hover`}>
+                              <input
+                                type="radio"
+                                name={`save-format-${entry.id}`}
+                                checked={saveFormat === 'json'}
+                                onChange={() => setSaveFormat('json')}
+                                className="accent-sky-600 mt-0.5"
+                              />
+                              <span>
+                                <strong>JSON</strong>
+                                <span className={`block text-[10px] text-ink-muted`}>
+                                  Project only, no media. For experts and version control.
+                                </span>
+                              </span>
+                            </label>
+                            <div className="flex gap-1.5 pt-1">
+                              <button
+                                onClick={() => runSaveMenu(entry.id)}
+                                className="flex-1 px-2.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-semibold"
+                              >
+                                {lang === 'zh' ? '保存' : 'Save'}
+                              </button>
+                              <button onClick={() => setSaveMenuId(null)} className={ghostButton}>
+                                {lang === 'zh' ? '取消' : 'Cancel'}
+                              </button>
+                            </div>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => void uploadProjectToDriveHandler(entry.id)}
+                      disabled={!driveToken || driveBusyId !== null}
+                      title={driveToken ? 'Save .osd project to Google Drive' : 'Connect Google Drive in the cloud dialog first'}
+                      aria-label="Save .osd project to Google Drive"
+                      className={`${ghostButton} disabled:opacity-40`}
+                    >
+                      <Upload className="w-3 h-3" />{driveBusyId === entry.id ? '…' : ''}
+                    </button>
+                    <button
+                      onClick={() => void uploadProjectToNextcloud(entry.id)}
+                      disabled={!nextcloud || driveBusyId !== null}
+                      title={nextcloud ? 'Save .osd project to Nextcloud' : 'Connect Nextcloud in the cloud dialog first'}
+                      aria-label="Save .osd project to Nextcloud"
+                      className={`${ghostButton} disabled:opacity-40`}
+                    >
+                      <Server className="w-3 h-3" />{driveBusyId === entry.id ? '…' : ''}
+                    </button>
+                    <button
+                      onClick={() => {
+                        setRevisionsProjectId(entry.id);
+                        setConfirmRestoreId(null);
+                      }}
+                      title="Named revisions"
+                      aria-label="Named revisions"
+                      className={ghostButton}
+                    >
+                      <History className="w-3 h-3" />
+                      {(readProject(entry.id)?.revisions?.length || 0) > 0 && (
+                        <span className="font-mono">{readProject(entry.id)?.revisions?.length}</span>
+                      )}
+                    </button>
+
+                    {confirmDeleteId === entry.id ? (
+                      <span className="flex items-center gap-1 ml-auto">
+                        <button
+                          onClick={() => {
+                            deleteProjectById(entry.id);
+                            setConfirmDeleteId(null);
+                          }}
+                          className="px-2 py-1 rounded-lg bg-rose-600 text-white text-[11px] font-semibold"
+                        >
+                          {lang === 'zh' ? '删除' : 'Delete'}
+                        </button>
+                        <button onClick={() => setConfirmDeleteId(null)} className={ghostButton}>
+                          {lang === 'zh' ? '取消' : 'Cancel'}
+                        </button>
+                      </span>
+                    ) : (
+                      <button
+                        onClick={() => setConfirmDeleteId(entry.id)}
+                        title={lang === 'zh' ? '删除项目' : 'Delete project'}
+                        aria-label={lang === 'zh' ? '删除项目' : 'Delete project'}
+                        className={`${ghostButton} ml-auto text-rose-500`}
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Release footer: version, licence, discrete support links. */}
+        <footer
+          className={`mt-8 pt-4 border-t flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[10px] ${
+            'border-line text-ink-subtle'
+          }`}
+        >
+          <span className="font-mono">MFF Spatial Designer v{APP_VERSION}</span>
+          <span aria-hidden="true">·</span>
+          <span>Free &amp; open source (GPL-3.0)</span>
+          <span aria-hidden="true">·</span>
+          <a
+            href={SPONSOR_LINKS.github}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="inline-flex items-center gap-1 hover:underline"
+          >
+            <Heart className="w-3 h-3" /> Sponsor
+          </a>
+          <span aria-hidden="true">·</span>
+          <a
+            href={SPONSOR_LINKS.coffee}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="inline-flex items-center gap-1 hover:underline"
+          >
+            <Coffee className="w-3 h-3" /> Buy me a coffee
+          </a>
+        </footer>
+
+        {pendingMerge && (
+          <MergeConflictDialog
+            fileName={pendingMerge.fileName}
+            theirChanges={pendingMerge.theirChanges}
+            conflicts={pendingMerge.conflicts}
+            onApply={(useTheirs) => pendingMerge.settle(useTheirs)}
+            onCancel={() => pendingMerge.settle(null)}
+          />
+        )}
+
+        {/* Google Drive backup: manual one-way .osd export. Backup dialog,
+            not sync: nothing uploads itself. */}
+        {driveOpen && (
+          <div className="fixed inset-0 z-[80] flex items-center justify-center p-4">
+            <div
+              className={`absolute inset-0 bg-slate-950/40 dark:bg-black/60`}
+              onClick={() => setDriveOpen(false)}
+            />
+            <div
+              ref={driveDialogRef}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="dashboard-drive-title"
+              tabIndex={-1}
+              className={`relative w-full max-w-lg border rounded-2xl shadow-2xl p-4 ${panel}`}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h3 id="dashboard-drive-title" className="text-sm font-bold flex items-center gap-1.5">
+                    <Cloud className="w-4 h-4 text-sky-500" /> Cloud backup
+                  </h3>
+                  <p className={`text-[11px] mt-1 text-ink-muted`}>
+                    Manual one-way .osd backups — Google Drive or your own Nextcloud/WebDAV server.
+                    Re-saving refreshes its file. Needs internet; everything else keeps working offline.
+                  </p>
+                  <div className="flex gap-1.5 mt-2.5" role="tablist" aria-label="Cloud provider">
+                    <button
+                      role="tab"
+                      aria-selected={cloudTab === 'drive'}
+                      onClick={() => setCloudTab('drive')}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold flex items-center gap-1.5 transition-colors ${
+                        cloudTab === 'drive'
+                          ? 'bg-sky-600 text-white'
+                          : isLight ? 'border border-slate-300 text-slate-600 hover:bg-slate-100' : 'border border-slate-700 text-slate-300 hover:bg-slate-800'
+                      }`}
+                    >
+                      <Cloud className="w-3.5 h-3.5" /> Google Drive
+                    </button>
+                    <button
+                      role="tab"
+                      aria-selected={cloudTab === 'nextcloud'}
+                      onClick={() => setCloudTab('nextcloud')}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold flex items-center gap-1.5 transition-colors ${
+                        cloudTab === 'nextcloud'
+                          ? 'bg-sky-600 text-white'
+                          : isLight ? 'border border-slate-300 text-slate-600 hover:bg-slate-100' : 'border border-slate-700 text-slate-300 hover:bg-slate-800'
+                      }`}
+                    >
+                      <Server className="w-3.5 h-3.5" /> Nextcloud
+                    </button>
+                  </div>
+                </div>
+                <button onClick={() => setDriveOpen(false)} aria-label="Close cloud backup" className={ghostButton}>
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              {cloudTab === 'drive' && (
+              <div className="mt-4">
+                {driveToken ? (
+                  <button onClick={disconnectDrive} className={`${ghostButton} justify-center py-2 w-fit`} title="Sign out of Google Drive on this browser">
+                    <Cloud className="w-3.5 h-3.5" /> Connected — disconnect
+                  </button>
+                ) : hasBuiltInClientId ? (
+                  <button
+                    onClick={() => void connectDrive()}
+                    disabled={driveConnecting}
+                    className="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white text-sm font-semibold flex items-center justify-center gap-1.5 w-fit"
+                    title="Sign in with Google"
+                  >
+                    <Cloud className="w-4 h-4" /> {driveConnecting ? 'Connecting…' : 'Connect with Google'}
+                  </button>
+                ) : (
+                  <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
+                    <input
+                      value={driveClientId}
+                      onChange={(event) => setDriveClientId(event.target.value.trim())}
+                      placeholder="Google OAuth Client ID (see setup steps)"
+                      aria-label="Google OAuth Client ID"
+                      className={`${field} sm:flex-1 font-mono text-xs`}
+                    />
+                    <button
+                      onClick={() => void connectDrive()}
+                      disabled={driveConnecting || effectiveDriveClientId === ''}
+                      className="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white text-sm font-semibold flex items-center justify-center gap-1.5"
+                      title={effectiveDriveClientId === '' ? 'Enter your OAuth Client ID first' : 'Sign in with Google'}
+                    >
+                      <Cloud className="w-4 h-4" /> {driveConnecting ? 'Connecting…' : 'Connect'}
+                    </button>
+                  </div>
+                )}
+
+              <details className={`mt-3 text-[11px] text-ink-muted`}>
+                <summary className="cursor-pointer font-semibold hover:underline w-fit">
+                  {hasBuiltInClientId ? 'Self-hosting? Use your own Client ID' : 'One-time setup: get your own Client ID'}
+                </summary>
+                {hasBuiltInClientId ? (
+                  <div className="mt-1.5 space-y-2">
+                    <p>This copy comes with sign-in ready. Only if you host the app yourself (own domain),
+                      register your own OAuth Client ID — origins are bound to it — and paste it here:</p>
+                    <input
+                      value={driveClientId}
+                      onChange={(event) => setDriveClientId(event.target.value.trim())}
+                      placeholder="Your own Google OAuth Client ID (overrides the built-in one)"
+                      aria-label="Own Google OAuth Client ID"
+                      className={`${field} font-mono text-xs`}
+                    />
+                  </div>
+                ) : (
+                  <ol className="mt-1.5 ml-4 list-decimal space-y-1">
+                    <li>Open the Google Cloud Console → APIs &amp; Services → Credentials.</li>
+                    <li>Create Credentials → OAuth client ID → application type “Web application”.</li>
+                    <li>Under Authorized JavaScript origins add this site's address (and http://localhost:3000 for local use).</li>
+                    <li>Enable the Google Drive API under APIs &amp; Services → Library.</li>
+                    <li>Paste the Client ID above and press Connect. The app only ever asks for access to files it created itself.</li>
+                  </ol>
+                )}
+              </details>
+
+              {driveToken && (
+                <div className="mt-3">
+                  <div className="flex items-center gap-2 mb-1.5">
+                    <span className="text-[10px] font-bold uppercase tracking-wide opacity-60">
+                      Projects on your Drive {driveFiles.length > 0 && `(${driveFiles.length})`}
+                    </span>
+                    <button onClick={() => void refreshDriveFileList()} disabled={driveListBusy} className={ghostButton}>
+                      {driveListBusy ? 'Loading…' : driveFiles.length ? 'Refresh' : 'Show'}
+                    </button>
+                  </div>
+                  {driveFiles.length > 0 && (
+                    <ul className="space-y-1.5 max-h-56 overflow-y-auto">
+                      {driveFiles.map((file) => (
+                        <li key={file.id} className="border rounded-xl px-3 py-2 flex items-center justify-between gap-2 border-line">
+                          <div className="min-w-0">
+                            <div className="text-xs font-semibold truncate">{file.name}</div>
+                            <div className="text-[10px] text-ink-muted">
+                              {[file.modifiedTime ? `saved ${new Date(file.modifiedTime).toLocaleString()}` : undefined, file.size !== undefined ? formatBytes(file.size) : undefined].filter(Boolean).join(' · ')}
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => void importDriveFile(file)}
+                            disabled={driveBusyFile !== null}
+                            title={`Open ${file.name} as a project in this browser`}
+                            className={`${ghostButton} flex-shrink-0 disabled:opacity-40`}
+                          >
+                            <Download className="w-3 h-3" /> {driveBusyFile === file.id ? 'Opening…' : 'Open'}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+
+              <p className={`mt-3 text-[11px] text-ink-muted`}>
+                To save: press the Drive button on any production below. A project opened from Drive saves back to the same file, and you are asked first if someone else saved it since.
+              </p>
+              </div>
+              )}
+
+              {cloudTab === 'nextcloud' && (
+              <div className="mt-4">
+                {nextcloud ? (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={`text-[11px] font-semibold flex items-center gap-1.5 text-ink-soft`}>
+                      <Server className="w-3.5 h-3.5 text-emerald-500" /> Connected to {hostOf(nextcloud.baseUrl)}
+                    </span>
+                    <button onClick={() => void refreshNcFileList()} disabled={ncBusy} className={ghostButton}>
+                      {ncBusy ? 'Refreshing…' : 'Refresh'}
+                    </button>
+                    <button onClick={disconnectNextcloud} className={ghostButton} title="Forget this server on this browser">
+                      Disconnect
+                    </button>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <input
+                      value={ncUrl}
+                      onChange={(event) => setNcUrl(event.target.value.trim())}
+                      placeholder="Server address, e.g. https://cloud.example.com/remote.php/dav/files/alex"
+                      aria-label="Nextcloud server address"
+                      className={`${field} font-mono text-xs`}
+                    />
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        value={ncUser}
+                        onChange={(event) => setNcUser(event.target.value)}
+                        placeholder="User name"
+                        aria-label="Nextcloud user name"
+                        autoComplete="username"
+                        className={`${field} sm:flex-1 text-xs`}
+                      />
+                      <input
+                        type="password"
+                        value={ncPassword}
+                        onChange={(event) => setNcPassword(event.target.value)}
+                        placeholder="Password or app password"
+                        aria-label="Nextcloud password or app password"
+                        autoComplete="current-password"
+                        className={`${field} sm:flex-1 font-mono text-xs`}
+                      />
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        onClick={() => void connectNextcloud()}
+                        disabled={ncBusy || ncUrl.trim() === '' || ncUser === '' || ncPassword === ''}
+                        className="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white text-sm font-semibold flex items-center justify-center gap-1.5"
+                        title="Connect to Nextcloud"
+                      >
+                        <Server className="w-4 h-4" /> {ncBusy ? 'Connecting…' : 'Connect'}
+                      </button>
+                      <label className={`flex items-center gap-1.5 text-[11px] cursor-pointer text-ink-muted`} title="Keep the password in this browser for next time">
+                        <input
+                          type="checkbox"
+                          checked={ncRemember}
+                          onChange={(event) => setNcRemember(event.target.checked)}
+                          className="accent-sky-600"
+                        />
+                        Remember password
+                      </label>
+                    </div>
+                  </div>
+                )}
+
+                {nextcloud && (
+                  <div className="mt-3">
+                    <div className="text-[10px] font-bold uppercase tracking-wide opacity-60 mb-1.5">
+                      Backups on this server {ncFiles.length > 0 && `(${ncFiles.length})`}
+                    </div>
+                    {ncFiles.length === 0 ? (
+                      <p className={`text-[11px] text-ink-muted`}>
+                        Nothing here yet — press the server button on a production below to save its first backup.
+                      </p>
+                    ) : (
+                      <ul className="space-y-1.5 max-h-56 overflow-y-auto">
+                        {ncFiles.map((file) => (
+                          <li
+                            key={file.href}
+                            className={`border rounded-xl px-3 py-2 flex items-center justify-between gap-2 ${
+                              'border-line'
+                            }`}
+                          >
+                            <div className="min-w-0">
+                              <div className="text-xs font-semibold truncate">{file.name}</div>
+                              {file.size !== undefined && (
+                                <div className={`text-[10px] text-ink-subtle`}>
+                                  {formatBytes(file.size)}
+                                </div>
+                              )}
+                            </div>
+                            <button
+                              onClick={() => void importWebdavFile(file)}
+                              disabled={ncBusyFile !== null}
+                              title={`Import ${file.name} as a project in this browser`}
+                              className={`${ghostButton} flex-shrink-0 disabled:opacity-40`}
+                            >
+                              <Download className="w-3 h-3" /> {ncBusyFile === file.name ? 'Opening…' : 'Open'}
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+
+                <details className={`mt-3 text-[11px] text-ink-muted`}>
+                  <summary className="cursor-pointer font-semibold hover:underline w-fit">
+                    Where is the address? Use an app password
+                  </summary>
+                  <div className="mt-1.5 space-y-1">
+                    <p>Nextcloud: Files app → Settings → “Copy WebDAV address” (ends in <span className="font-mono">/dav/files/&lt;you&gt;</span>). Then Personal settings → Security → Devices &amp; sessions → Create an app password — your main password stays out of this browser.</p>
+                    <p>Plain WebDAV shares work too: anything answering PROPFIND/PUT/GET with Basic auth.</p>
+                  </div>
+                </details>
+
+                <p className={`mt-3 text-[11px] text-ink-muted`}>
+                  To save: press the server button on any production below. To open: press Open beside a file. Saving it again updates that file, and you are asked first if someone else saved it since.
+                </p>
+              </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {storageOpen && (
+          <div className="fixed inset-0 z-[80] flex items-center justify-center p-4">
+            <div
+              className={`absolute inset-0 bg-slate-950/40 dark:bg-black/60`}
+              onClick={() => setStorageOpen(false)}
+            />
+            <div
+              ref={storageDialogRef}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="dashboard-storage-title"
+              tabIndex={-1}
+              className={`relative w-full max-w-lg border rounded-2xl shadow-2xl p-4 ${panel}`}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h3 id="dashboard-storage-title" className="text-sm font-bold flex items-center gap-1.5">
+                    <HardDrive className="w-4 h-4 text-accent-ink" /> Browser media storage
+                  </h3>
+                  <p className={`text-[11px] mt-1 text-ink-muted`}>
+                    Checks attached media against every saved project. Cleanup never removes a file still referenced by a project.
+                  </p>
+                </div>
+                <button onClick={() => setStorageOpen(false)} aria-label="Close storage inspector" className={ghostButton}>
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              {storageBusy && !storageInspection ? (
+                <p className="py-8 text-center text-xs opacity-60">Scanning media…</p>
+              ) : storageInspection ? (
+                <>
+                  <div className="grid grid-cols-3 gap-2 my-4">
+                    {[
+                      ['Stored', formatBytes(storageInspection.storedBytes)],
+                      ['In projects', formatBytes(storageInspection.referencedBytes)],
+                      ['Orphaned', formatBytes(storageInspection.orphanedBytes)],
+                    ].map(([label, value]) => (
+                      <div key={label} className={`rounded-xl border p-2.5 border-line bg-surface-sunken`}>
+                        <div className="text-[10px] font-bold uppercase opacity-50">{label}</div>
+                        <div className="text-sm font-mono font-bold mt-0.5">{value}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className={`rounded-xl border p-3 text-xs border-line`}>
+                    <div className="flex justify-between gap-3"><span>Stored files</span><strong>{storageInspection.assets.length}</strong></div>
+                    <div className="flex justify-between gap-3 mt-1"><span>Unreferenced files</span><strong>{storageInspection.orphanedIds.length}</strong></div>
+                    <div className={`flex justify-between gap-3 mt-1 ${storageInspection.missingIds.length ? 'text-rose-500' : ''}`}>
+                      <span>Missing referenced files</span><strong>{storageInspection.missingIds.length}</strong>
+                    </div>
+                  </div>
+                  {storageInspection.missingIds.length > 0 && (
+                    <p className="mt-3 text-[11px] text-rose-500">
+                      Some project media is missing. Export a package from a device that still has the files, then import it here.
+                    </p>
+                  )}
+                  <div className="mt-4 flex items-center justify-between gap-2">
+                    <button onClick={() => void scanStorage()} disabled={storageBusy} className={ghostButton}>
+                      {storageBusy ? 'Scanning…' : 'Scan again'}
+                    </button>
+                    {storageInspection.orphanedIds.length > 0 && (
+                      confirmStorageCleanup ? (
+                        <span className="flex items-center gap-1.5">
+                          <span className="text-[10px] opacity-60">Delete {storageInspection.orphanedIds.length} file(s)?</span>
+                          <button onClick={() => void cleanStorage()} disabled={storageBusy} className="px-2 py-1 rounded-lg bg-rose-600 text-white text-[11px] font-semibold">Delete</button>
+                          <button onClick={() => setConfirmStorageCleanup(false)} className={ghostButton}>Cancel</button>
+                        </span>
+                      ) : (
+                        <button onClick={() => setConfirmStorageCleanup(true)} className={`${ghostButton} text-rose-500`}>
+                          <Trash2 className="w-3 h-3" /> Clean orphaned media
+                        </button>
+                      )
+                    )}
+                  </div>
+                </>
+              ) : (
+                <p className="py-8 text-center text-xs text-rose-500">Storage could not be inspected.</p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Revisions list for one project (named milestones, plan §13.2) */}
+        {revisionsProject && (
+          <div className="fixed inset-0 z-[80] flex items-center justify-center p-4">
+            <div
+              className={`absolute inset-0 bg-slate-950/40 dark:bg-black/60`}
+              onClick={() => {
+                setRevisionsProjectId(null);
+                setConfirmRestoreId(null);
+              }}
+            />
+            <div
+              ref={revisionsDialogRef}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="dashboard-revisions-title"
+              tabIndex={-1}
+              className={`relative w-full max-w-md border rounded-2xl shadow-2xl p-4 ${panel}`}
+            >
+              <div className="flex items-start justify-between gap-3 mb-3">
+                <div>
+                  <h3 id="dashboard-revisions-title" className="text-sm font-bold flex items-center gap-1.5">
+                    <History className="w-4 h-4 text-accent-ink" /> Revisions — {revisionsProject.title}
+                  </h3>
+                  <p className={`text-[11px] mt-0.5 text-ink-muted`}>
+                    Named milestones of this production. Restoring keeps the revision history — a safety revision is saved first.
+                  </p>
+                </div>
+                <button
+                  onClick={() => {
+                    setRevisionsProjectId(null);
+                    setConfirmRestoreId(null);
+                  }}
+                  title="Close"
+                  aria-label="Close"
+                  className={`p-1.5 rounded-lg border border-line-strong hover:bg-surface-hover`}
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              {revisionsList.length === 0 ? (
+                <p className={`text-xs py-6 text-center text-ink-subtle`}>
+                  No revisions saved yet. Use “Save revision…” in the top bar to mark one.
+                </p>
+              ) : (
+                <ul className="max-h-72 overflow-y-auto space-y-1.5">
+                  {[...revisionsList].reverse().map((revision) => (
+                    <li
+                      key={revision.id}
+                      className={`border rounded-xl px-3 py-2 flex items-center justify-between gap-2 ${
+                        'border-line'
+                      }`}
+                    >
+                      <div className="min-w-0">
+                        <div className="text-xs font-semibold truncate">{revision.name}</div>
+                        <div className={`text-[10px] text-ink-subtle`}>
+                          {new Date(revision.createdAt).toLocaleString()}
+                          {revision.note ? ` · ${revision.note}` : ''}
+                        </div>
+                      </div>
+                      {confirmRestoreId === revision.id ? (
+                        <span className="flex items-center gap-1 flex-shrink-0">
+                          <button
+                            onClick={() => handleRestore(revision.id)}
+                            className="px-2 py-1 rounded-lg bg-accent hover:bg-accent-hover text-white text-[11px] font-semibold"
+                          >
+                            Confirm
+                          </button>
+                          <button onClick={() => setConfirmRestoreId(null)} className={ghostButton}>
+                            Cancel
+                          </button>
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => setConfirmRestoreId(revision.id)}
+                          title="Restore this revision"
+                          className={`${ghostButton} flex-shrink-0`}
+                        >
+                          Restore
+                        </button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
